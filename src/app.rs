@@ -179,6 +179,20 @@ async fn fetch_inner(url: &str) -> Result<BgMsg> {
         let text = String::from_utf8_lossy(&resp.body);
         let lines = text.lines().map(str::to_owned).collect();
         (lines, Vec::new())
+    } else if resp
+        .content_type
+        .as_deref()
+        .map(|ct| ct.starts_with("image/"))
+        .unwrap_or(false)
+    {
+        let ct = resp.content_type.as_deref().unwrap_or("image");
+        let lines = vec![
+            format!("[{ct} — {} bytes]", resp.body.len()),
+            String::new(),
+            "Image rendering in terminal not supported for direct URLs in Phase 1.".into(),
+            "Phase 2 will render inline images within HTML pages.".into(),
+        ];
+        (lines, Vec::new())
     } else {
         return Err(anyhow::anyhow!(
             "unsupported content type: {:?}",

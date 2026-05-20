@@ -19,6 +19,7 @@ path = "src/lib.rs"
 tokio = { version = "1.40", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "brotli", "stream", "http2"] }
 bytes = "1.11"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 scraper = "0.20"
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }

@@ -60,10 +60,10 @@ fn render_element(el: ElementRef<'_>, buf: &mut String) {
             }
             Node::Element(_) => {
                 if let Some(child_el) = ElementRef::wrap(child) {
-                    if child_el.value().name() == "a" {
-                        render_link(child_el, buf);
-                    } else {
-                        render_element(child_el, buf);
+                    match child_el.value().name() {
+                        "a" => render_link(child_el, buf),
+                        "img" => render_img(child_el, buf),
+                        _ => render_element(child_el, buf),
                     }
                 }
             }
@@ -78,6 +78,18 @@ fn render_element(el: ElementRef<'_>, buf: &mut String) {
     if is_block {
         buf.push('\n');
     }
+}
+
+fn render_img(el: ElementRef<'_>, buf: &mut String) {
+    let src = el.value().attr("src").unwrap_or("");
+    let alt = el.value().attr("alt").unwrap_or("img");
+    buf.push_str("\x1b[2m[");
+    buf.push_str(alt);
+    if !src.is_empty() {
+        buf.push_str(": ");
+        buf.push_str(src);
+    }
+    buf.push_str("]\x1b[0m ");
 }
 
 fn render_link(el: ElementRef<'_>, buf: &mut String) {

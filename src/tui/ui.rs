@@ -2,7 +2,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -29,6 +29,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(addr_text).style(addr_style), addr_area);
 
     // ── Content pane ─────────────────────────────────────────────────────────
+    if app.lines.is_empty() && !app.loading {
+        let msg = if app.status.is_empty() {
+            "No content".to_owned()
+        } else {
+            app.status.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(msg)
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(Color::Red)),
+            content_area,
+        );
+    }
+
     let viewport_h = content_area.height as usize;
     let visible: Vec<Line> = app
         .lines
