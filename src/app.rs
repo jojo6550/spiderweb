@@ -13,198 +13,237 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::{self, Sender};
 
 use crate::{
+    browser::{bookmarks::Bookmarks, tabs::TabManager},
+    config::settings::Settings,
     network::client::SpiderClient,
     parser::html::ParsedPage,
-    renderer::text as text_renderer,
+    renderer::text::{self as text_renderer, RenderedLink},
     tui::{keybinds, ui},
 };
+
+// ── Input mode ────────────────────────────────────────────────────────────────
+
+/// Current keyboard input mode.
+pub enum InputMode {
+    Normal,
+    /// Search mode — string is the live query being typed.
+    Search(String),
+}
 
 // ── Background message ────────────────────────────────────────────────────────
 
 /// Messages sent from background fetch tasks to the event loop.
 pub enum BgMsg {
-    /// Page fetched and rendered successfully.
     Loaded {
+        tab_idx: usize,
         url: String,
+        title: Option<String>,
         lines: Vec<String>,
-        links: Vec<String>,
+        links: Vec<RenderedLink>,
     },
-    /// Fetch or parse failed.
-    Error { message: String },
+    Error {
+        tab_idx: usize,
+        message: String,
+    },
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
 /// Central application state — owned by the main TUI event loop.
 pub struct App {
-    /// URL currently displayed.
-    pub url: String,
-    /// Plain-text content lines for display.
-    pub lines: Vec<String>,
-    /// Absolute or root-relative hrefs extracted from the page.
-    pub links: Vec<String>,
-    /// Vertical scroll offset (line index).
-    pub scroll: usize,
-    /// Index into `links` of the currently highlighted link.
-    pub selected_link: Option<usize>,
-    /// One-line status message shown in the status bar.
+    pub tabs: TabManager,
+    pub bookmarks: Bookmarks,
+    pub settings: Settings,
     pub status: String,
-    /// `true` while a fetch is in progress.
-    pub loading: bool,
-    /// Set to `true` to exit the event loop.
     pub quit: bool,
+    pub input_mode: InputMode,
 }
 
 impl App {
-    fn new(url: String) -> Self {
+    pub fn new(url: String, settings: Settings, bookmarks: Bookmarks) -> Self {
         Self {
-            url,
-            lines: Vec::new(),
-            links: Vec::new(),
-            scroll: 0,
-            selected_link: None,
+            tabs: TabManager::new(url),
+            bookmarks,
+            settings,
             status: String::new(),
-            loading: true,
             quit: false,
+            input_mode: InputMode::Normal,
         }
     }
 
-    /// Apply a background message received from a fetch task.
     pub fn handle_msg(&mut self, msg: BgMsg) {
         match msg {
-            BgMsg::Loaded { url, lines, links } => {
-                self.url = url;
-                self.lines = lines;
-                self.links = links;
-                self.scroll = 0;
-                self.selected_link = None;
-                self.loading = false;
-                self.status = String::new();
+            BgMsg::Loaded { tab_idx, url, title, lines, links } => {
+                if let Some(tab) = self.tabs.tabs.get_mut(tab_idx) {
+                    tab.url = url;
+                    tab.title = title.unwrap_or_default();
+                    tab.lines = lines;
+                    tab.links = links;
+                    tab.scroll = 0;
+                    tab.selected_link = None;
+                    tab.loading = false;
+                    tab.clear_search();
+                }
             }
-            BgMsg::Error { message } => {
-                self.loading = false;
+            BgMsg::Error { tab_idx, message } => {
+                if let Some(tab) = self.tabs.tabs.get_mut(tab_idx) {
+                    tab.loading = false;
+                    tab.lines = vec![
+                        format!("Error: {message}"),
+                        String::new(),
+                        "Press Backspace to go back.".into(),
+                    ];
+                    tab.links.clear();
+                }
                 self.status = format!("Error: {message}");
             }
         }
     }
 
-    /// Scroll down by `n` lines, clamped.
-    pub fn scroll_down(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_add(n).min(self.lines.len().saturating_sub(1));
+    /// Navigate the current tab to `href`, resolving relative URLs against the tab's current URL.
+    pub fn navigate(&mut self, href: String, tx: &Sender<BgMsg>) {
+        let base = self.tabs.current().url.clone();
+        let Some(url) = resolve_url(&base, &href) else {
+            self.status = format!("Skipped: {href}");
+            return;
+        };
+        let tab = self.tabs.current_mut();
+        tab.history.push(tab.url.clone());
+        tab.url = url.clone();
+        tab.loading = true;
+        tab.selected_link = None;
+        tab.clear_search();
+        self.status.clear();
+        let tab_idx = self.tabs.active;
+        tokio::spawn(fetch_page(url, tab_idx, tx.clone()));
     }
 
-    /// Scroll up by `n` lines.
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
+    pub fn go_back(&mut self, tx: &Sender<BgMsg>) {
+        let tab_idx = self.tabs.active;
+        let tab = self.tabs.current_mut();
+        let current = tab.url.clone();
+        if let Some(prev) = tab.history.go_back(&current) {
+            tab.url = prev.clone();
+            tab.loading = true;
+            tab.selected_link = None;
+            tab.clear_search();
+            self.status.clear();
+            tokio::spawn(fetch_page(prev, tab_idx, tx.clone()));
+        } else {
+            self.status = "No history".into();
+        }
     }
 
-    /// Scroll to last line.
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll = self.lines.len().saturating_sub(1);
+    pub fn go_forward(&mut self, tx: &Sender<BgMsg>) {
+        let tab_idx = self.tabs.active;
+        let tab = self.tabs.current_mut();
+        let current = tab.url.clone();
+        if let Some(next) = tab.history.go_forward(&current) {
+            tab.url = next.clone();
+            tab.loading = true;
+            tab.selected_link = None;
+            tab.clear_search();
+            self.status.clear();
+            tokio::spawn(fetch_page(next, tab_idx, tx.clone()));
+        } else {
+            self.status = "No forward history".into();
+        }
     }
 
-    /// Advance to the next link, wrapping around.
-    pub fn next_link(&mut self) {
-        if self.links.is_empty() {
+    /// Open a new tab navigating to `href` (resolved relative to the current tab's URL).
+    pub fn open_new_tab(&mut self, href: String, tx: &Sender<BgMsg>) {
+        let base = self.tabs.current().url.clone();
+        let Some(url) = resolve_url(&base, &href) else {
+            self.status = format!("Skipped: {href}");
+            return;
+        };
+        let tab_idx = self.tabs.open_new(url.clone());
+        tokio::spawn(fetch_page(url, tab_idx, tx.clone()));
+    }
+
+    /// Toggle bookmark for the current tab's URL; persists immediately.
+    pub fn toggle_bookmark(&mut self) {
+        let tab = self.tabs.current();
+        let url = tab.url.clone();
+        let title = tab.title.clone();
+        if self.bookmarks.contains(&url) {
+            self.bookmarks.remove(&url);
+            self.status = "Bookmark removed".into();
+        } else {
+            self.bookmarks.add(url, title);
+            self.status = "Bookmarked!".into();
+        }
+        if let Err(e) = self.bookmarks.save() {
+            self.status = format!("Save failed: {e}");
+        }
+    }
+
+    /// Show up to 5 bookmarks in the status bar.
+    pub fn list_bookmarks(&mut self) {
+        if self.bookmarks.entries.is_empty() {
+            self.status = "No bookmarks (press b to bookmark this page)".into();
             return;
         }
-        self.selected_link = Some(match self.selected_link {
-            None => 0,
-            Some(i) => (i + 1) % self.links.len(),
-        });
+        let list: Vec<String> = self
+            .bookmarks
+            .entries
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(i, b)| format!("[{}] {}", i + 1, b.url))
+            .collect();
+        let extra = if self.bookmarks.entries.len() > 5 {
+            format!("  (+{} more)", self.bookmarks.entries.len() - 5)
+        } else {
+            String::new()
+        };
+        self.status = format!("{}{extra}", list.join("  "));
     }
+}
 
-    /// Move to the previous link, wrapping around.
-    pub fn prev_link(&mut self) {
-        if self.links.is_empty() {
-            return;
-        }
-        self.selected_link = Some(match self.selected_link {
-            None => self.links.len().saturating_sub(1),
-            Some(0) => self.links.len().saturating_sub(1),
-            Some(i) => i - 1,
-        });
-    }
+// ── URL resolver ──────────────────────────────────────────────────────────────
 
-    /// Return the href of the currently selected link, if any.
-    pub fn selected_link_url(&self) -> Option<String> {
-        let idx = self.selected_link?;
-        self.links.get(idx).cloned()
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_owned());
     }
-
-    /// Return the content line index that contains link `sel`, used for highlight.
-    /// Phase 1 stub — returns `None` (full link↔line mapping is Phase 2).
-    pub fn link_line_idx(&self, _sel: usize) -> Option<usize> {
-        None
+    if href.is_empty() || href.starts_with("mailto:") || href.starts_with("javascript:") {
+        return None;
     }
-
-    /// Navigate to `url`: mark loading and spawn fetch task.
-    pub fn navigate(&mut self, url: String, tx: &Sender<BgMsg>) {
-        // Phase 1: absolute URLs only.
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            self.status = format!("Skipped relative URL: {url}");
-            return;
-        }
-        self.url = url.clone();
-        self.loading = true;
-        self.status = String::new();
-        let tx = tx.clone();
-        tokio::spawn(fetch_page(url, tx));
-    }
+    url::Url::parse(base).ok()?.join(href).ok().map(|u| u.to_string())
 }
 
 // ── Fetch task ────────────────────────────────────────────────────────────────
 
-async fn fetch_page(url: String, tx: Sender<BgMsg>) {
-    let msg = fetch_inner(&url).await.unwrap_or_else(|e| BgMsg::Error {
+async fn fetch_page(url: String, tab_idx: usize, tx: Sender<BgMsg>) {
+    let msg = fetch_inner(&url, tab_idx).await.unwrap_or_else(|e| BgMsg::Error {
+        tab_idx,
         message: e.to_string(),
     });
     let _ = tx.send(msg).await;
 }
 
-async fn fetch_inner(url: &str) -> Result<BgMsg> {
+async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     let client = SpiderClient::new()?;
     let resp = client.fetch(url).await?;
 
-    let (lines, links) = if resp.is_html() {
+    let (lines, links, title) = if resp.is_html() {
         let page = ParsedPage::from_bytes(&resp.body);
-        let links: Vec<String> = page.links().into_iter().map(|l| l.href).collect();
-        let ansi = text_renderer::render(&page);
-        let lines = text_renderer::strip_ansi(&ansi)
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        (lines, links)
+        let title = page.title();
+        let rendered = text_renderer::render_full(&page);
+        (rendered.lines, rendered.links, title)
     } else if resp.is_text() {
         let text = String::from_utf8_lossy(&resp.body);
         let lines = text.lines().map(str::to_owned).collect();
-        (lines, Vec::new())
-    } else if resp
-        .content_type
-        .as_deref()
-        .map(|ct| ct.starts_with("image/"))
-        .unwrap_or(false)
-    {
-        let ct = resp.content_type.as_deref().unwrap_or("image");
-        let lines = vec![
-            format!("[{ct} — {} bytes]", resp.body.len()),
-            String::new(),
-            "Image rendering in terminal not supported for direct URLs in Phase 1.".into(),
-            "Phase 2 will render inline images within HTML pages.".into(),
-        ];
-        (lines, Vec::new())
+        (lines, Vec::new(), None)
     } else {
-        return Err(anyhow::anyhow!(
-            "unsupported content type: {:?}",
-            resp.content_type
-        ));
+        let ct = resp.content_type.as_deref().unwrap_or("binary");
+        let lines =
+            vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
+        (lines, Vec::new(), None)
     };
 
-    Ok(BgMsg::Loaded {
-        url: url.to_owned(),
-        lines,
-        links,
-    })
+    Ok(BgMsg::Loaded { tab_idx, url: url.to_owned(), title, lines, links })
 }
 
 // ── Terminal helpers ──────────────────────────────────────────────────────────
@@ -226,12 +265,13 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 /// Run the browser starting at `url`.
 pub async fn run(url: String) -> Result<()> {
+    let settings = Settings::load().unwrap_or_default();
+    let bookmarks = Bookmarks::load().unwrap_or_else(|_| Bookmarks::empty());
+
     let (tx, mut rx) = mpsc::channel::<BgMsg>(8);
+    let mut app = App::new(url.clone(), settings, bookmarks);
+    tokio::spawn(fetch_page(url, 0, tx.clone()));
 
-    let mut app = App::new(url.clone());
-    tokio::spawn(fetch_page(url, tx.clone()));
-
-    // Panic hook: restore terminal before printing panic message.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -281,27 +321,51 @@ async fn event_loop(
 mod tests {
     use super::*;
 
-    #[test]
-    fn scroll_clamps() {
-        let mut app = App::new("https://example.com".into());
-        app.lines = vec!["a".into(), "b".into(), "c".into()];
-        app.scroll_down(100);
-        assert_eq!(app.scroll, 2);
-        app.scroll_up(100);
-        assert_eq!(app.scroll, 0);
+    fn make_app() -> App {
+        App::new("https://example.com".into(), Settings::default(), Bookmarks::empty())
     }
 
     #[test]
-    fn link_cycling() {
-        let mut app = App::new("https://example.com".into());
-        app.links = vec!["https://a.com".into(), "https://b.com".into()];
-        app.next_link();
-        assert_eq!(app.selected_link, Some(0));
-        app.next_link();
-        assert_eq!(app.selected_link, Some(1));
-        app.next_link();
-        assert_eq!(app.selected_link, Some(0));
-        app.prev_link();
-        assert_eq!(app.selected_link, Some(1));
+    fn scroll_clamps() {
+        let mut app = make_app();
+        let tab = app.tabs.current_mut();
+        tab.lines = vec!["a".into(), "b".into(), "c".into()];
+        tab.loading = false;
+        tab.scroll_down(100);
+        assert_eq!(tab.scroll, 2);
+        tab.scroll_up(100);
+        assert_eq!(tab.scroll, 0);
+    }
+
+    #[test]
+    fn resolve_relative() {
+        let r = resolve_url("https://example.com/foo/bar", "/about");
+        assert_eq!(r.as_deref(), Some("https://example.com/about"));
+    }
+
+    #[test]
+    fn resolve_absolute_passthrough() {
+        let r = resolve_url("https://example.com", "https://other.com/page");
+        assert_eq!(r.as_deref(), Some("https://other.com/page"));
+    }
+
+    #[test]
+    fn resolve_mailto_returns_none() {
+        assert!(resolve_url("https://example.com", "mailto:x@y.com").is_none());
+    }
+
+    #[test]
+    fn resolve_javascript_returns_none() {
+        assert!(resolve_url("https://example.com", "javascript:void(0)").is_none());
+    }
+
+    #[test]
+    fn bookmark_toggle() {
+        let mut app = make_app();
+        app.tabs.current_mut().loading = false;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.contains("https://example.com"));
+        app.toggle_bookmark();
+        assert!(!app.bookmarks.contains("https://example.com"));
     }
 }
