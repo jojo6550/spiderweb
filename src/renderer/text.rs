@@ -128,9 +128,8 @@ fn normalize(s: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Strip ANSI escape sequences for test assertions.
-#[cfg(test)]
-fn strip_ansi(s: &str) -> String {
+/// Strip ANSI escape sequences from a string.
+pub fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut esc = false;
     for ch in s.chars() {
