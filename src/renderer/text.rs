@@ -247,6 +247,10 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
                     match child_el.value().name() {
                         "a" => render_link(child_el, ctx),
                         "img" => render_img(child_el, ctx),
+                        "input" => render_input(child_el, ctx),
+                        "button" => render_button(child_el, ctx),
+                        "textarea" => render_textarea(child_el, ctx),
+                        "select" => render_select(child_el, ctx),
                         _ => render_element(child_el, ctx, hidden),
                     }
                 }
@@ -322,6 +326,101 @@ fn render_img(el: ElementRef<'_>, ctx: &mut Ctx) {
     ctx.push_str(&alt);
     ctx.push_str("]\x1b[0m");
     ctx.push_char('\n');
+}
+
+fn render_input(el: ElementRef<'_>, ctx: &mut Ctx) {
+    let val = el.value();
+    let ty = val.attr("type").unwrap_or("text").to_ascii_lowercase();
+    match ty.as_str() {
+        "hidden" => {}
+        "submit" | "button" | "reset" => {
+            let label = val.attr("value").unwrap_or("Submit");
+            ctx.push_ansi("\x1b[7m ");
+            ctx.push_str(label);
+            ctx.push_ansi(" \x1b[0m ");
+        }
+        "checkbox" => {
+            let mark = if val.attr("checked").is_some() { "[x]" } else { "[ ]" };
+            ctx.push_str(mark);
+            ctx.push_char(' ');
+        }
+        "radio" => {
+            let mark = if val.attr("checked").is_some() { "(•)" } else { "( )" };
+            ctx.push_str(mark);
+            ctx.push_char(' ');
+        }
+        _ => {
+            let value = val.attr("value").unwrap_or("");
+            let placeholder = val.attr("placeholder").unwrap_or("");
+            let name = val.attr("name").unwrap_or("");
+            let label = if !value.is_empty() {
+                value.to_owned()
+            } else if !placeholder.is_empty() {
+                placeholder.to_owned()
+            } else if !name.is_empty() {
+                name.to_owned()
+            } else {
+                "input".to_owned()
+            };
+            ctx.push_ansi("\x1b[2m[");
+            ctx.push_str(&label);
+            ctx.push_str(" __]\x1b[0m ");
+        }
+    }
+}
+
+fn render_button(el: ElementRef<'_>, ctx: &mut Ctx) {
+    let text: String = el.text().collect();
+    let text = text.trim();
+    if text.is_empty() {
+        let label = el.value().attr("value").unwrap_or("Button");
+        ctx.push_ansi("\x1b[7m ");
+        ctx.push_str(label);
+        ctx.push_ansi(" \x1b[0m ");
+        return;
+    }
+    ctx.push_ansi("\x1b[7m ");
+    ctx.push_str(text);
+    ctx.push_ansi(" \x1b[0m ");
+}
+
+fn render_textarea(el: ElementRef<'_>, ctx: &mut Ctx) {
+    let val = el.value();
+    let initial: String = el.text().collect();
+    let initial = initial.trim();
+    let placeholder = val.attr("placeholder").unwrap_or("");
+    let name = val.attr("name").unwrap_or("textarea");
+    let preview = if !initial.is_empty() {
+        initial.lines().next().unwrap_or("").to_owned()
+    } else if !placeholder.is_empty() {
+        placeholder.to_owned()
+    } else {
+        name.to_owned()
+    };
+    ctx.push_ansi("\x1b[2m[");
+    ctx.push_str(&preview);
+    ctx.push_str(" __]\x1b[0m ");
+}
+
+fn render_select(el: ElementRef<'_>, ctx: &mut Ctx) {
+    let mut chosen: Option<String> = None;
+    for opt in el.children().filter_map(ElementRef::wrap) {
+        if opt.value().name() != "option" {
+            continue;
+        }
+        let text: String = opt.text().collect();
+        let text = text.trim().to_owned();
+        if opt.value().attr("selected").is_some() {
+            chosen = Some(text);
+            break;
+        } else if chosen.is_none() {
+            chosen = Some(text);
+        }
+    }
+    let label = chosen.unwrap_or_else(|| "▼".to_owned());
+    ctx.push_ansi("\x1b[2m[");
+    ctx.push_str(&label);
+    ctx.push_str(" ▼]\x1b[0m ");
 }
 
 fn render_link(el: ElementRef<'_>, ctx: &mut Ctx) {
@@ -412,6 +511,55 @@ mod tests {
         let plain = strip_ansi(&render(&page));
         assert!(plain.contains("• One"), "got: {plain:?}");
         assert!(plain.contains("• Two"));
+    }
+
+    #[test]
+    fn input_text_renders_with_placeholder() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><input type="text" placeholder="Search"></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Search"), "got: {plain:?}");
+    }
+
+    #[test]
+    fn input_submit_renders_value_as_button() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><input type="submit" value="Go!"></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Go!"));
+    }
+
+    #[test]
+    fn button_text_rendered() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><button>Click Me</button></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Click Me"));
+    }
+
+    #[test]
+    fn hidden_input_skipped() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><p>Hi</p><input type="hidden" name="csrf" value="secret"></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(!plain.contains("secret"), "hidden value leaked: {plain:?}");
+    }
+
+    #[test]
+    fn select_shows_selected_option() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><select>
+                <option>One</option>
+                <option selected>Two</option>
+                <option>Three</option>
+            </select></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Two"));
     }
 
     #[test]

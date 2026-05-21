@@ -16,7 +16,7 @@ use crate::{
     browser::{bookmarks::Bookmarks, tabs::TabManager},
     config::settings::Settings,
     network::client::SpiderClient,
-    parser::html::ParsedPage,
+    parser::{html::ParsedPage, layout},
     renderer::{
         image as image_renderer,
         text::{self as text_renderer, RenderedImage, RenderedLink},
@@ -230,7 +230,7 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     let client = SpiderClient::new()?;
     let resp = client.fetch(url).await?;
 
-    let (mut lines, mut links, title, images): (
+    let (mut lines, mut links, title, mut images): (
         Vec<String>,
         Vec<RenderedLink>,
         Option<String>,
@@ -253,6 +253,9 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     if !images.is_empty() {
         inline_images(&mut lines, &mut links, &images, url).await;
     }
+
+    // Word-wrap text lines to readable width; preserves image lines as-is.
+    lines = layout::wrap_lines(lines, &mut links, &mut images, layout::DEFAULT_WIDTH);
 
     Ok(BgMsg::Loaded { tab_idx, url: url.to_owned(), title, lines, links })
 }
