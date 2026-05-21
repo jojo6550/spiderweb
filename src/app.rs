@@ -443,7 +443,9 @@ async fn event_loop(
             }
             Some(Ok(event)) = events.next() => {
                 if let Event::Key(key) = event {
-                    keybinds::handle(key, app, tx);
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        keybinds::handle(key, app, tx);
+                    }
                 }
             }
         }
