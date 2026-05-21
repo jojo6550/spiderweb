@@ -125,6 +125,22 @@ impl Ctx {
         self.buf.push_str(&level.to_string());
         self.buf.push(MARKER);
     }
+
+    /// Push a code-span start marker for span index `idx`.
+    fn push_code_start_marker(&mut self, idx: usize) {
+        self.buf.push(MARKER);
+        self.buf.push('C');
+        self.buf.push_str(&idx.to_string());
+        self.buf.push(MARKER);
+    }
+
+    /// Push a code-span end marker for span index `idx`.
+    fn push_code_end_marker(&mut self, idx: usize) {
+        self.buf.push(MARKER);
+        self.buf.push('Z');
+        self.buf.push_str(&idx.to_string());
+        self.buf.push(MARKER);
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -275,6 +291,12 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
     let tag = el.value().name();
 
     if SKIP.contains(&tag) || is_hidden(el, hidden) {
+        return;
+    }
+
+    // Inline code elements — always handled as inline, never as block.
+    if matches!(tag, "code" | "kbd" | "tt") {
+        render_code_span(el, ctx);
         return;
     }
 
@@ -508,6 +530,21 @@ fn render_link(el: ElementRef<'_>, ctx: &mut Ctx) {
     ctx.push_ansi("\x1b[4;36m");
     ctx.push_str(text);
     ctx.push_ansi("\x1b[0m ");
+}
+
+/// Render an inline `<code>`, `<kbd>`, or `<tt>` element, recording its char
+/// offsets so that `render_full` can later tag it as a [`CodeSpan`].
+fn render_code_span(el: ElementRef<'_>, ctx: &mut Ctx) {
+    let text: String = el.text().collect();
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let idx = ctx.code_spans.len();
+    ctx.code_spans.push(CodeSpan { line: 0, start: 0, end: 0 });
+    ctx.push_code_start_marker(idx);
+    ctx.push_str(text);
+    ctx.push_code_end_marker(idx);
 }
 
 fn heading_level(tag: &str) -> Option<usize> {
@@ -770,5 +807,27 @@ mod tests {
         let rp = render_full(&page);
         let line = rp.lines.iter().find(|l| l.contains("Hello")).unwrap();
         assert!(line.starts_with("▌ "), "got: {line:?}");
+    }
+
+    #[test]
+    fn code_span_recorded_with_offsets() {
+        let page = ParsedPage::parse_html(
+            "<html><body><p>Use <code>rustup</code> to install</p></body></html>"
+        );
+        let rp = render_full(&page);
+        assert_eq!(rp.code_spans.len(), 1, "expected 1 code span");
+        let cs = &rp.code_spans[0];
+        let line = &rp.lines[cs.line];
+        let slice: String = line.chars().skip(cs.start).take(cs.end - cs.start).collect();
+        assert_eq!(slice, "rustup", "got slice: {slice:?} from line: {line:?}");
+    }
+
+    #[test]
+    fn multiple_code_spans_recorded() {
+        let page = ParsedPage::parse_html(
+            "<html><body><p><code>foo</code> and <code>bar</code></p></body></html>"
+        );
+        let rp = render_full(&page);
+        assert_eq!(rp.code_spans.len(), 2);
     }
 }

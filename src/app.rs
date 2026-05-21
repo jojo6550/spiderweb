@@ -234,28 +234,38 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     let client = SpiderClient::new()?;
     let resp = client.fetch(url).await?;
 
-    let (mut lines, mut links, title, mut images, mut line_kinds, code_spans): (
-        Vec<String>,
-        Vec<RenderedLink>,
-        Option<String>,
-        Vec<RenderedImage>,
-        Vec<text_renderer::LineKind>,
-        Vec<text_renderer::CodeSpan>,
-    ) = if resp.is_html() {
-        let page = ParsedPage::from_bytes(&resp.body);
-        let title = page.title();
-        let rendered = text_renderer::render_full(&page);
-        (rendered.lines, rendered.links, title, rendered.images, rendered.line_kinds, rendered.code_spans)
-    } else if resp.is_text() {
-        let text = String::from_utf8_lossy(&resp.body);
-        let ls: Vec<String> = text.lines().map(str::to_owned).collect();
-        let lk = vec![text_renderer::LineKind::Normal; ls.len()];
-        (ls, Vec::new(), None, Vec::new(), lk, Vec::new())
-    } else {
-        let ct = resp.content_type.as_deref().unwrap_or("binary");
-        let lines = vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
-        (lines, Vec::new(), None, Vec::new(), vec![text_renderer::LineKind::Normal], Vec::new())
-    };
+    struct PageData {
+        lines: Vec<String>,
+        links: Vec<RenderedLink>,
+        title: Option<String>,
+        images: Vec<RenderedImage>,
+        line_kinds: Vec<text_renderer::LineKind>,
+        code_spans: Vec<text_renderer::CodeSpan>,
+    }
+
+    let PageData { mut lines, mut links, title, mut images, mut line_kinds, code_spans } =
+        if resp.is_html() {
+            let page = ParsedPage::from_bytes(&resp.body);
+            let title = page.title();
+            let r = text_renderer::render_full(&page);
+            PageData {
+                lines: r.lines,
+                links: r.links,
+                title,
+                images: r.images,
+                line_kinds: r.line_kinds,
+                code_spans: r.code_spans,
+            }
+        } else if resp.is_text() {
+            let text = String::from_utf8_lossy(&resp.body);
+            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            let line_kinds = vec![text_renderer::LineKind::Normal; lines.len()];
+            PageData { lines, links: Vec::new(), title: None, images: Vec::new(), line_kinds, code_spans: Vec::new() }
+        } else {
+            let ct = resp.content_type.as_deref().unwrap_or("binary");
+            let lines = vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
+            PageData { lines, links: Vec::new(), title: None, images: Vec::new(), line_kinds: vec![text_renderer::LineKind::Normal], code_spans: Vec::new() }
+        };
 
     if !images.is_empty() {
         inline_images(&mut lines, &mut links, &images, url, &client).await;
