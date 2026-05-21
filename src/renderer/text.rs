@@ -198,14 +198,10 @@ fn render_link(el: ElementRef<'_>, ctx: &mut Ctx) {
     let line = ctx.line;
     ctx.push_ansi("\x1b[4;36m");
     ctx.push_str(text);
-    ctx.push_ansi("\x1b[0m");
+    ctx.push_ansi("\x1b[0m ");
     if !href.is_empty() {
-        ctx.push_ansi("\x1b[2m[");
-        ctx.push_str(href);
-        ctx.push_str("]\x1b[0m");
         ctx.links.push(RenderedLink { href: href.to_owned(), line });
     }
-    ctx.push_char(' ');
 }
 
 fn heading_level(tag: &str) -> Option<usize> {
@@ -261,12 +257,14 @@ mod tests {
     }
 
     #[test]
-    fn link_includes_href() {
+    fn link_text_shown_href_hidden() {
         let page =
             ParsedPage::parse_html(r#"<html><body><a href="/about">About</a></body></html>"#);
         let out = render(&page);
-        assert!(out.contains("About"));
-        assert!(out.contains("/about"));
+        assert!(strip_ansi(&out).contains("About"));
+        assert!(!strip_ansi(&out).contains("/about"), "href must not appear inline");
+        let rp = render_full(&page);
+        assert_eq!(rp.links[0].href, "/about");
     }
 
     #[test]
