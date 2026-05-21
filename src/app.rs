@@ -17,7 +17,10 @@ use crate::{
     config::settings::Settings,
     network::client::SpiderClient,
     parser::html::ParsedPage,
-    renderer::text::{self as text_renderer, RenderedLink},
+    renderer::{
+        image as image_renderer,
+        text::{self as text_renderer, RenderedImage, RenderedLink},
+    },
     tui::{keybinds, ui},
 };
 
@@ -227,23 +230,96 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     let client = SpiderClient::new()?;
     let resp = client.fetch(url).await?;
 
-    let (lines, links, title) = if resp.is_html() {
+    let (mut lines, mut links, title, images): (
+        Vec<String>,
+        Vec<RenderedLink>,
+        Option<String>,
+        Vec<RenderedImage>,
+    ) = if resp.is_html() {
         let page = ParsedPage::from_bytes(&resp.body);
         let title = page.title();
         let rendered = text_renderer::render_full(&page);
-        (rendered.lines, rendered.links, title)
+        (rendered.lines, rendered.links, title, rendered.images)
     } else if resp.is_text() {
         let text = String::from_utf8_lossy(&resp.body);
         let lines = text.lines().map(str::to_owned).collect();
-        (lines, Vec::new(), None)
+        (lines, Vec::new(), None, Vec::new())
     } else {
         let ct = resp.content_type.as_deref().unwrap_or("binary");
-        let lines =
-            vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
-        (lines, Vec::new(), None)
+        let lines = vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
+        (lines, Vec::new(), None, Vec::new())
     };
 
+    if !images.is_empty() {
+        inline_images(&mut lines, &mut links, &images, url).await;
+    }
+
     Ok(BgMsg::Loaded { tab_idx, url: url.to_owned(), title, lines, links })
+}
+
+/// Fetch every image concurrently, convert to ANSI half-block lines, and
+/// splice into `lines` in place of each placeholder. Shifts subsequent link
+/// line numbers to account for inserted rows.
+async fn inline_images(
+    lines: &mut Vec<String>,
+    links: &mut [RenderedLink],
+    images: &[RenderedImage],
+    base_url: &str,
+) {
+    use futures_util::future::join_all;
+
+    const MAX_IMAGES: usize = 24;
+    const MAX_CELLS_WIDE: u32 = 80;
+    const MAX_CELLS_TALL: u32 = 18;
+
+    let fetches = images.iter().enumerate().take(MAX_IMAGES).map(|(idx, img)| {
+        let src = img.src.clone();
+        let base = base_url.to_owned();
+        async move {
+            let abs = resolve_url(&base, &src)?;
+            let client = SpiderClient::new().ok()?;
+            let resp = client.fetch(&abs).await.ok()?;
+            let body = resp.body.to_vec();
+            let ansi = tokio::task::spawn_blocking(move || {
+                image_renderer::to_ansi_lines(&body, MAX_CELLS_WIDE, MAX_CELLS_TALL)
+            })
+            .await
+            .ok()?
+            .ok()?;
+            Some((idx, ansi))
+        }
+    });
+
+    let mut results: Vec<(usize, Vec<String>)> =
+        join_all(fetches).await.into_iter().flatten().collect();
+
+    // Splice from largest line index down so earlier positions remain valid.
+    results.sort_by(|a, b| {
+        images
+            .get(b.0)
+            .map(|i| i.line)
+            .unwrap_or(0)
+            .cmp(&images.get(a.0).map(|i| i.line).unwrap_or(0))
+    });
+
+    for (img_idx, ansi_lines) in results {
+        let Some(img) = images.get(img_idx) else { continue };
+        let pos = img.line;
+        if pos >= lines.len() {
+            continue;
+        }
+        lines.remove(pos);
+        let n_inserted = ansi_lines.len();
+        for (i, l) in ansi_lines.into_iter().enumerate() {
+            lines.insert(pos + i, l);
+        }
+        let delta = n_inserted as isize - 1;
+        for link in links.iter_mut() {
+            if link.line > pos {
+                link.line = ((link.line as isize) + delta).max(0) as usize;
+            }
+        }
+    }
 }
 
 // ── Terminal helpers ──────────────────────────────────────────────────────────

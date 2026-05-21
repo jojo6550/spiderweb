@@ -3,3 +3,5 @@
 .vscode/
 *.swp
 *.log
+.claude/settings.local.json
+.superpowers/

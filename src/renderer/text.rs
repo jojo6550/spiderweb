@@ -27,45 +27,71 @@ pub struct RenderedLink {
     pub line: usize,
 }
 
-/// Full render result: plain-text lines plus link metadata.
+/// An image extracted from the rendered page, with its placeholder line.
+#[derive(Debug, Clone)]
+pub struct RenderedImage {
+    pub src: String,
+    pub alt: String,
+    /// Zero-based index into [`RenderedPage::lines`] of the placeholder.
+    pub line: usize,
+}
+
+/// Full render result: plain-text lines plus link/image metadata.
 pub struct RenderedPage {
     pub lines: Vec<String>,
     pub links: Vec<RenderedLink>,
+    pub images: Vec<RenderedImage>,
 }
 
 // ── Render context ────────────────────────────────────────────────────────────
 
+// Markers placed inline during render so we can locate links and images
+// reliably in the post-normalize output. Private-use area chars survive
+// strip_ansi but are stripped from the final output before returning.
+const MARKER: char = '\u{F000}';
+
 struct Ctx {
     buf: String,
     links: Vec<RenderedLink>,
-    /// Current line index (counts `\n` written to `buf`).
-    line: usize,
+    images: Vec<RenderedImage>,
 }
 
 impl Ctx {
     fn new() -> Self {
-        Self { buf: String::with_capacity(4096), links: Vec::new(), line: 0 }
+        Self {
+            buf: String::with_capacity(4096),
+            links: Vec::new(),
+            images: Vec::new(),
+        }
     }
 
     fn push_str(&mut self, s: &str) {
-        for ch in s.chars() {
-            if ch == '\n' {
-                self.line += 1;
-            }
-            self.buf.push(ch);
-        }
+        self.buf.push_str(s);
     }
 
     fn push_char(&mut self, ch: char) {
-        if ch == '\n' {
-            self.line += 1;
-        }
         self.buf.push(ch);
     }
 
-    /// Push a raw ANSI escape sequence (no `\n` inside — line count unaffected).
+    /// Push a raw ANSI escape sequence (no `\n` inside).
     fn push_ansi(&mut self, s: &str) {
         self.buf.push_str(s);
+    }
+
+    /// Push a link-position marker for link index `idx`.
+    fn push_link_marker(&mut self, idx: usize) {
+        self.buf.push(MARKER);
+        self.buf.push('L');
+        self.buf.push_str(&idx.to_string());
+        self.buf.push(MARKER);
+    }
+
+    /// Push an image-position marker for image index `idx`.
+    fn push_image_marker(&mut self, idx: usize) {
+        self.buf.push(MARKER);
+        self.buf.push('I');
+        self.buf.push_str(&idx.to_string());
+        self.buf.push(MARKER);
     }
 }
 
@@ -76,33 +102,89 @@ pub fn render(page: &ParsedPage) -> String {
     let hidden = css::extract_hidden(page.document());
     let mut ctx = Ctx::new();
     render_element(page.document().root_element(), &mut ctx, &hidden);
-    normalize(&ctx.buf)
+    strip_markers(&normalize(&ctx.buf))
 }
 
-/// Render `page` to plain-text lines with link position metadata.
+/// Strip private-use position markers from `s`.
+fn strip_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == MARKER {
+            // Skip kind char + digits + closing marker.
+            chars.next();
+            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                chars.next();
+            }
+            if chars.peek() == Some(&MARKER) {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Render `page` to plain-text lines with link and image position metadata.
 pub fn render_full(page: &ParsedPage) -> RenderedPage {
     let hidden = css::extract_hidden(page.document());
     let mut ctx = Ctx::new();
     render_element(page.document().root_element(), &mut ctx, &hidden);
     let normalized = normalize(&ctx.buf);
-    let lines: Vec<String> = strip_ansi(&normalized).lines().map(str::to_owned).collect();
+    let stripped = strip_ansi(&normalized);
+    let mut lines: Vec<String> = stripped.lines().map(str::to_owned).collect();
 
-    // Re-map link line numbers through normalize's newline collapsing.
-    // Simple approach: search plain lines for link text / href.
-    let links = ctx
-        .links
-        .into_iter()
-        .map(|mut rl| {
-            // Find the actual line in the normalized output.
-            rl.line = lines
-                .iter()
-                .position(|l| !l.trim().is_empty() && l.contains(&rl.href))
-                .unwrap_or(rl.line.min(lines.len().saturating_sub(1)));
-            rl
-        })
-        .collect();
+    let mut links = ctx.links;
+    let mut images = ctx.images;
 
-    RenderedPage { lines, links }
+    // Scan each line for markers; record positions, then strip markers.
+    for (line_idx, line) in lines.iter_mut().enumerate() {
+        let mut buf = String::with_capacity(line.len());
+        let mut iter = line.chars().peekable();
+        while let Some(c) = iter.next() {
+            if c == MARKER {
+                let mut kind = '?';
+                let mut digits = String::new();
+                if let Some(&k) = iter.peek() {
+                    kind = k;
+                    iter.next();
+                }
+                while let Some(&d) = iter.peek() {
+                    if d.is_ascii_digit() {
+                        digits.push(d);
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Closing marker
+                if iter.peek() == Some(&MARKER) {
+                    iter.next();
+                }
+                if let Ok(idx) = digits.parse::<usize>() {
+                    match kind {
+                        'L' => {
+                            if let Some(rl) = links.get_mut(idx) {
+                                rl.line = line_idx;
+                            }
+                        }
+                        'I' => {
+                            if let Some(ri) = images.get_mut(idx) {
+                                ri.line = line_idx;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                buf.push(c);
+            }
+        }
+        *line = buf;
+    }
+
+    RenderedPage { lines, links, images }
 }
 
 /// Strip ANSI escape sequences from a string.
@@ -222,15 +304,24 @@ fn is_hidden(el: ElementRef<'_>, hidden: &HiddenSet) -> bool {
 }
 
 fn render_img(el: ElementRef<'_>, ctx: &mut Ctx) {
-    let src = el.value().attr("src").unwrap_or("");
-    let alt = el.value().attr("alt").unwrap_or("img");
-    ctx.push_ansi("\x1b[2m[");
-    ctx.push_str(alt);
-    if !src.is_empty() {
-        ctx.push_str(": ");
-        ctx.push_str(src);
+    let src = el.value().attr("src").unwrap_or("").to_owned();
+    let alt = el.value().attr("alt").unwrap_or("img").to_owned();
+    if src.is_empty() {
+        ctx.push_ansi("\x1b[2m[");
+        ctx.push_str(&alt);
+        ctx.push_str("]\x1b[0m ");
+        return;
     }
-    ctx.push_str("]\x1b[0m ");
+    let idx = ctx.images.len();
+    ctx.images.push(RenderedImage { src, alt: alt.clone(), line: 0 });
+
+    // Place image on its own line so splice can replace cleanly.
+    ctx.push_char('\n');
+    ctx.push_image_marker(idx);
+    ctx.push_ansi("\x1b[2m[img: ");
+    ctx.push_str(&alt);
+    ctx.push_str("]\x1b[0m");
+    ctx.push_char('\n');
 }
 
 fn render_link(el: ElementRef<'_>, ctx: &mut Ctx) {
@@ -240,13 +331,14 @@ fn render_link(el: ElementRef<'_>, ctx: &mut Ctx) {
     if text.is_empty() {
         return;
     }
-    let line = ctx.line;
+    let idx = ctx.links.len();
+    if !href.is_empty() {
+        ctx.links.push(RenderedLink { href: href.to_owned(), line: 0 });
+        ctx.push_link_marker(idx);
+    }
     ctx.push_ansi("\x1b[4;36m");
     ctx.push_str(text);
     ctx.push_ansi("\x1b[0m ");
-    if !href.is_empty() {
-        ctx.links.push(RenderedLink { href: href.to_owned(), line });
-    }
 }
 
 fn heading_level(tag: &str) -> Option<usize> {
@@ -320,6 +412,27 @@ mod tests {
         let plain = strip_ansi(&render(&page));
         assert!(plain.contains("• One"), "got: {plain:?}");
         assert!(plain.contains("• Two"));
+    }
+
+    #[test]
+    fn render_full_captures_image_metadata() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><p>Hi</p><img src="https://x.com/a.png" alt="A"/></body></html>"#,
+        );
+        let rp = render_full(&page);
+        assert_eq!(rp.images.len(), 1);
+        assert_eq!(rp.images[0].src, "https://x.com/a.png");
+        assert_eq!(rp.images[0].alt, "A");
+    }
+
+    #[test]
+    fn markers_stripped_from_render() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><a href="/x">Link</a><img src="a.png" alt="A"/></body></html>"#,
+        );
+        let out = render(&page);
+        // Marker char should not leak into final output.
+        assert!(!out.contains('\u{F000}'), "marker leaked: {out:?}");
     }
 
     #[test]
