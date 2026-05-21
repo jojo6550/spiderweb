@@ -83,15 +83,31 @@ impl App {
         }
     }
 
-    /// Enter link-hint mode, assigning a 2-letter code to each link.
-    /// Full implementation is in Task 6; this stub just sets the mode.
+    /// Home-row-first alphabet used for hint codes.
+    const HINT_CHARS: &'static [char] = &[
+        'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L',
+        'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P',
+        'Z', 'X', 'C', 'V', 'B', 'N', 'M',
+    ];
+
+    /// Enter link-hint mode, assigning a 2-letter Vimium-style code to each link.
     pub fn enter_hint_mode(&mut self) {
         let tab = self.tabs.current();
         if tab.links.is_empty() {
             self.status = "No links on page".into();
             return;
         }
-        // Full implementation in Task 6
+        let n = Self::HINT_CHARS.len();
+        self.hint_codes = tab
+            .links
+            .iter()
+            .enumerate()
+            .map(|(pos, _)| {
+                let first = Self::HINT_CHARS[pos / n];
+                let second = Self::HINT_CHARS[pos % n];
+                (pos, format!("{first}{second}"))
+            })
+            .collect();
         self.input_mode = InputMode::Hint(String::new());
     }
 
@@ -490,6 +506,37 @@ mod tests {
         assert!(app.bookmarks.contains("https://example.com"));
         app.toggle_bookmark();
         assert!(!app.bookmarks.contains("https://example.com"));
+    }
+
+    #[test]
+    fn enter_hint_mode_assigns_codes_for_all_links() {
+        let mut app = make_app();
+        let tab = app.tabs.current_mut();
+        tab.links = vec![
+            crate::renderer::text::RenderedLink { href: "https://a.com".into(), line: 0 },
+            crate::renderer::text::RenderedLink { href: "https://b.com".into(), line: 1 },
+            crate::renderer::text::RenderedLink { href: "https://c.com".into(), line: 2 },
+        ];
+        tab.loading = false;
+        app.enter_hint_mode();
+        assert!(matches!(app.input_mode, InputMode::Hint(_)));
+        assert_eq!(app.hint_codes.len(), 3);
+        // HINT_CHARS = [A,S,D,F,...] so index 0='A', 1='S', 2='D'
+        // pos=0: 0/27=0->'A', 0%27=0->'A' → "AA"
+        // pos=1: 1/27=0->'A', 1%27=1->'S' → "AS"
+        // pos=2: 2/27=0->'A', 2%27=2->'D' → "AD"
+        assert_eq!(app.hint_codes[0], (0, "AA".to_string()));
+        assert_eq!(app.hint_codes[1], (1, "AS".to_string()));
+        assert_eq!(app.hint_codes[2], (2, "AD".to_string()));
+    }
+
+    #[test]
+    fn enter_hint_mode_with_no_links_stays_normal() {
+        let mut app = make_app();
+        app.tabs.current_mut().loading = false;
+        app.enter_hint_mode();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(!app.status.is_empty());
     }
 
     #[test]

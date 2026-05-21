@@ -94,11 +94,58 @@ fn clear_last_segment(mut s: String) -> String {
     s
 }
 
-/// Stub for hint mode — Esc cancels, full implementation is Task 6.
-fn handle_hint(key: KeyEvent, app: &mut App, _tx: &Sender<BgMsg>) {
-    if let (KeyModifiers::NONE, KeyCode::Esc) = (key.modifiers, key.code) {
-        app.hint_codes.clear();
-        app.input_mode = InputMode::Normal;
+/// Full Vimium-style hint mode: accumulates typed chars, matches 2-char codes, navigates.
+fn handle_hint(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
+    let typed = match &app.input_mode {
+        InputMode::Hint(s) => s.clone(),
+        _ => return,
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.hint_codes.clear();
+            app.input_mode = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            let mut t = typed;
+            t.pop();
+            app.input_mode = InputMode::Hint(t);
+        }
+        KeyCode::Char(c) => {
+            let open_new_tab = key.modifiers.contains(KeyModifiers::SHIFT);
+            let upper = c.to_ascii_uppercase();
+            let mut new_typed = typed;
+            new_typed.push(upper);
+
+            if new_typed.len() >= 2 {
+                let matched = app
+                    .hint_codes
+                    .iter()
+                    .find(|(_, code)| *code == new_typed)
+                    .map(|(link_idx, _)| *link_idx);
+                app.hint_codes.clear();
+                app.input_mode = InputMode::Normal;
+                if let Some(link_idx) = matched {
+                    let href = app
+                        .tabs
+                        .current()
+                        .links
+                        .get(link_idx)
+                        .map(|l| l.href.clone());
+                    if let Some(href) = href {
+                        if open_new_tab {
+                            app.open_new_tab(href, tx);
+                        } else {
+                            app.navigate(href, tx);
+                        }
+                    }
+                } else {
+                    app.status = format!("No hint '{new_typed}'");
+                }
+            } else {
+                app.input_mode = InputMode::Hint(new_typed);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -273,6 +320,29 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle(key, &mut app, &tx);
         assert!(matches!(app.input_mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn hint_mode_esc_returns_normal_and_clears_codes() {
+        let mut app = make_app();
+        app.input_mode = InputMode::Hint("A".into());
+        app.hint_codes = vec![(0, "AA".into())];
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.hint_codes.is_empty());
+    }
+
+    #[test]
+    fn hint_mode_first_char_updates_typed() {
+        let mut app = make_app();
+        app.input_mode = InputMode::Hint(String::new());
+        app.hint_codes = vec![(0, "AA".into()), (1, "AS".into())];
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(&app.input_mode, InputMode::Hint(s) if s == "A"));
     }
 
     #[test]
