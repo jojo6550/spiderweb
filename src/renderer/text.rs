@@ -166,6 +166,7 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
     // Scan each line for markers; record positions, then strip markers.
     for (line_idx, line) in lines.iter_mut().enumerate() {
         let mut buf = String::with_capacity(line.len());
+        let mut char_count: usize = 0;
         let mut iter = line.chars().peekable();
         while let Some(c) = iter.next() {
             if c == MARKER {
@@ -218,14 +219,16 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
                         if let Ok(i) = digits.parse::<usize>() {
                             if let Some(cs) = code_spans.get_mut(i) {
                                 cs.line = line_idx;
-                                cs.start = buf.chars().count();
+                                cs.start = char_count;
                             }
                         }
                     }
                     'Z' => {
                         if let Ok(i) = digits.parse::<usize>() {
                             if let Some(cs) = code_spans.get_mut(i) {
-                                cs.end = buf.chars().count();
+                                if cs.line == line_idx {
+                                    cs.end = char_count;
+                                }
                             }
                         }
                     }
@@ -233,6 +236,7 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
                 }
             } else {
                 buf.push(c);
+                char_count += 1;
             }
         }
         *line = buf;
