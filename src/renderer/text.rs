@@ -36,11 +36,32 @@ pub struct RenderedImage {
     pub line: usize,
 }
 
+/// Per-line semantic kind for typography styling in draw_content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineKind {
+    #[default]
+    Normal,
+    H1,
+    H2,
+    H3,
+    H4Plus,
+}
+
+/// Char-offset range of an inline code span within a rendered line.
+#[derive(Debug, Clone)]
+pub struct CodeSpan {
+    pub line: usize,
+    pub start: usize, // char offset in stripped line (inclusive)
+    pub end: usize,   // char offset in stripped line (exclusive)
+}
+
 /// Full render result: plain-text lines plus link/image metadata.
 pub struct RenderedPage {
     pub lines: Vec<String>,
     pub links: Vec<RenderedLink>,
     pub images: Vec<RenderedImage>,
+    pub line_kinds: Vec<LineKind>,
+    pub code_spans: Vec<CodeSpan>,
 }
 
 // ── Render context ────────────────────────────────────────────────────────────
@@ -54,6 +75,7 @@ struct Ctx {
     buf: String,
     links: Vec<RenderedLink>,
     images: Vec<RenderedImage>,
+    code_spans: Vec<CodeSpan>,
 }
 
 impl Ctx {
@@ -62,6 +84,7 @@ impl Ctx {
             buf: String::with_capacity(4096),
             links: Vec::new(),
             images: Vec::new(),
+            code_spans: Vec::new(),
         }
     }
 
@@ -137,6 +160,8 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
 
     let mut links = ctx.links;
     let mut images = ctx.images;
+    let mut code_spans = ctx.code_spans;
+    let mut line_kinds = vec![LineKind::Normal; lines.len()];
 
     // Scan each line for markers; record positions, then strip markers.
     for (line_idx, line) in lines.iter_mut().enumerate() {
@@ -162,20 +187,49 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
                 if iter.peek() == Some(&MARKER) {
                     iter.next();
                 }
-                if let Ok(idx) = digits.parse::<usize>() {
-                    match kind {
-                        'L' => {
+                match kind {
+                    'L' => {
+                        if let Ok(idx) = digits.parse::<usize>() {
                             if let Some(rl) = links.get_mut(idx) {
                                 rl.line = line_idx;
                             }
                         }
-                        'I' => {
+                    }
+                    'I' => {
+                        if let Ok(idx) = digits.parse::<usize>() {
                             if let Some(ri) = images.get_mut(idx) {
                                 ri.line = line_idx;
                             }
                         }
-                        _ => {}
                     }
+                    'H' => {
+                        if let Ok(level) = digits.parse::<usize>() {
+                            if let Some(lk) = line_kinds.get_mut(line_idx) {
+                                *lk = match level {
+                                    1 => LineKind::H1,
+                                    2 => LineKind::H2,
+                                    3 => LineKind::H3,
+                                    _ => LineKind::H4Plus,
+                                };
+                            }
+                        }
+                    }
+                    'C' => {
+                        if let Ok(i) = digits.parse::<usize>() {
+                            if let Some(cs) = code_spans.get_mut(i) {
+                                cs.line = line_idx;
+                                cs.start = buf.len();
+                            }
+                        }
+                    }
+                    'Z' => {
+                        if let Ok(i) = digits.parse::<usize>() {
+                            if let Some(cs) = code_spans.get_mut(i) {
+                                cs.end = buf.len();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             } else {
                 buf.push(c);
@@ -184,7 +238,7 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
         *line = buf;
     }
 
-    RenderedPage { lines, links, images }
+    RenderedPage { lines, links, images, line_kinds, code_spans }
 }
 
 /// Strip ANSI escape sequences from a string.
@@ -639,5 +693,26 @@ mod tests {
         let page = ParsedPage::parse_html("<html><body></body></html>");
         let out = render(&page);
         assert!(out.is_empty() || out.chars().all(|c| c.is_whitespace()));
+    }
+
+    #[test]
+    fn line_kinds_default_normal() {
+        let page = ParsedPage::parse_html("<html><body><p>Hello</p></body></html>");
+        let rp = render_full(&page);
+        assert!(rp.line_kinds.iter().all(|k| *k == LineKind::Normal));
+    }
+
+    #[test]
+    fn rendered_page_has_line_kinds_same_length_as_lines() {
+        let page = ParsedPage::parse_html("<html><body><h1>T</h1><p>P</p></body></html>");
+        let rp = render_full(&page);
+        assert_eq!(rp.lines.len(), rp.line_kinds.len());
+    }
+
+    #[test]
+    fn code_spans_empty_for_plain_text() {
+        let page = ParsedPage::parse_html("<html><body><p>Hello world</p></body></html>");
+        let rp = render_full(&page);
+        assert!(rp.code_spans.is_empty());
     }
 }

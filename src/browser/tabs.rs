@@ -1,7 +1,7 @@
 //! Tab management: per-tab content, history, scroll, and link state.
 
 use crate::browser::history::History;
-use crate::renderer::text::RenderedLink;
+use crate::renderer::text::{CodeSpan, LineKind, RenderedLink};
 
 /// State for a single browser tab.
 pub struct Tab {
@@ -10,6 +10,8 @@ pub struct Tab {
     pub history: History,
     pub lines: Vec<String>,
     pub links: Vec<RenderedLink>,
+    pub line_kinds: Vec<LineKind>,
+    pub code_spans: Vec<CodeSpan>,
     pub scroll: usize,
     pub selected_link: Option<usize>,
     pub loading: bool,
@@ -25,6 +27,8 @@ impl Tab {
             history: History::new(),
             lines: Vec::new(),
             links: Vec::new(),
+            line_kinds: Vec::new(),
+            code_spans: Vec::new(),
             scroll: 0,
             selected_link: None,
             loading: true,
