@@ -9,6 +9,7 @@ use crate::network::response::HttpResponse;
 const USER_AGENT: &str = concat!("spiderweb/", env!("CARGO_PKG_VERSION"), " (terminal browser)");
 
 /// Async HTTP client for spiderweb.
+#[derive(Clone)]
 pub struct SpiderClient {
     inner: Client,
 }

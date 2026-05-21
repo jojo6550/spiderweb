@@ -251,7 +251,7 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     };
 
     if !images.is_empty() {
-        inline_images(&mut lines, &mut links, &images, url).await;
+        inline_images(&mut lines, &mut links, &images, url, &client).await;
     }
 
     // Word-wrap text lines to readable width; preserves image lines as-is.
@@ -260,28 +260,33 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
     Ok(BgMsg::Loaded { tab_idx, url: url.to_owned(), title, lines, links })
 }
 
-/// Fetch every image concurrently, convert to ANSI half-block lines, and
-/// splice into `lines` in place of each placeholder. Shifts subsequent link
-/// line numbers to account for inserted rows.
+/// Fetch images concurrently (shared client), convert to ANSI half-block lines,
+/// splice into `lines` in place of each placeholder. Shifts link line numbers
+/// to account for inserted rows. Per-image timeout caps total page latency.
 async fn inline_images(
     lines: &mut Vec<String>,
     links: &mut [RenderedLink],
     images: &[RenderedImage],
     base_url: &str,
+    client: &SpiderClient,
 ) {
     use futures_util::future::join_all;
+    use std::time::Duration;
 
-    const MAX_IMAGES: usize = 24;
+    const MAX_IMAGES: usize = 12;
     const MAX_CELLS_WIDE: u32 = 80;
     const MAX_CELLS_TALL: u32 = 18;
+    const PER_IMAGE_TIMEOUT: Duration = Duration::from_secs(4);
 
     let fetches = images.iter().enumerate().take(MAX_IMAGES).map(|(idx, img)| {
         let src = img.src.clone();
         let base = base_url.to_owned();
         async move {
             let abs = resolve_url(&base, &src)?;
-            let client = SpiderClient::new().ok()?;
-            let resp = client.fetch(&abs).await.ok()?;
+            let resp = tokio::time::timeout(PER_IMAGE_TIMEOUT, client.fetch(&abs))
+                .await
+                .ok()?
+                .ok()?;
             let body = resp.body.to_vec();
             let ansi = tokio::task::spawn_blocking(move || {
                 image_renderer::to_ansi_lines(&body, MAX_CELLS_WIDE, MAX_CELLS_TALL)
