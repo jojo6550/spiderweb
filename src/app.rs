@@ -31,6 +31,10 @@ pub enum InputMode {
     Normal,
     /// Search mode — string is the live query being typed.
     Search(String),
+    /// URL edit mode — string is the editable address bar buffer.
+    Url(String),
+    /// Hint mode — string is the typed hint letters so far.
+    Hint(String),
 }
 
 // ── Background message ────────────────────────────────────────────────────────
@@ -62,6 +66,8 @@ pub struct App {
     pub status: String,
     pub quit: bool,
     pub input_mode: InputMode,
+    /// Hint codes for link-hint mode: (link_index, 2-letter code).
+    pub hint_codes: Vec<(usize, String)>,
 }
 
 impl App {
@@ -73,7 +79,20 @@ impl App {
             status: String::new(),
             quit: false,
             input_mode: InputMode::Normal,
+            hint_codes: Vec::new(),
         }
+    }
+
+    /// Enter link-hint mode, assigning a 2-letter code to each link.
+    /// Full implementation is in Task 6; this stub just sets the mode.
+    pub fn enter_hint_mode(&mut self) {
+        let tab = self.tabs.current();
+        if tab.links.is_empty() {
+            self.status = "No links on page".into();
+            return;
+        }
+        // Full implementation in Task 6
+        self.input_mode = InputMode::Hint(String::new());
     }
 
     pub fn handle_msg(&mut self, msg: BgMsg) {
@@ -471,5 +490,18 @@ mod tests {
         assert!(app.bookmarks.contains("https://example.com"));
         app.toggle_bookmark();
         assert!(!app.bookmarks.contains("https://example.com"));
+    }
+
+    #[test]
+    fn o_key_enters_url_mode_with_current_url() {
+        let mut app = make_app();
+        app.tabs.current_mut().loading = false;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        crate::tui::keybinds::handle(key, &mut app, &tx);
+        assert!(matches!(app.input_mode, InputMode::Url(ref s) if s == "https://example.com"));
     }
 }

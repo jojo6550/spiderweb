@@ -7,17 +7,18 @@ use crate::app::{App, BgMsg, InputMode};
 
 /// Dispatch a key event based on current input mode.
 pub fn handle(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
-    if matches!(app.input_mode, InputMode::Search(_)) {
-        handle_search(key, app);
-    } else {
-        handle_normal(key, app, tx);
+    match &app.input_mode {
+        InputMode::Search(_) => handle_search(key, app),
+        InputMode::Url(_) => handle_url(key, app, tx),
+        InputMode::Hint(_) => handle_hint(key, app, tx),
+        InputMode::Normal => handle_normal(key, app, tx),
     }
 }
 
 fn handle_search(key: KeyEvent, app: &mut App) {
     let query = match &app.input_mode {
         InputMode::Search(q) => q.clone(),
-        InputMode::Normal => return,
+        _ => return,
     };
 
     match key.code {
@@ -46,6 +47,58 @@ fn handle_search(key: KeyEvent, app: &mut App) {
             app.input_mode = InputMode::Search(q);
         }
         _ => {}
+    }
+}
+
+fn handle_url(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
+    let buf = match &app.input_mode {
+        InputMode::Url(b) => b.clone(),
+        _ => return,
+    };
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            app.input_mode = InputMode::Normal;
+        }
+        (KeyModifiers::NONE, KeyCode::Enter) => {
+            let url = buf.clone();
+            app.input_mode = InputMode::Normal;
+            if !url.is_empty() {
+                app.navigate(url, tx);
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Backspace) => {
+            let mut b = buf;
+            b.pop();
+            app.input_mode = InputMode::Url(b);
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+            app.input_mode = InputMode::Url(clear_last_segment(buf));
+        }
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+            let mut b = buf;
+            b.push(c);
+            app.input_mode = InputMode::Url(b);
+        }
+        _ => {}
+    }
+}
+
+/// Pop trailing slash/space, then pop back to the previous slash/space.
+fn clear_last_segment(mut s: String) -> String {
+    while s.ends_with('/') || s.ends_with(' ') {
+        s.pop();
+    }
+    while !s.is_empty() && !s.ends_with('/') && !s.ends_with(' ') {
+        s.pop();
+    }
+    s
+}
+
+/// Stub for hint mode — Esc cancels, full implementation is Task 6.
+fn handle_hint(key: KeyEvent, app: &mut App, _tx: &Sender<BgMsg>) {
+    if let (KeyModifiers::NONE, KeyCode::Esc) = (key.modifiers, key.code) {
+        app.hint_codes.clear();
+        app.input_mode = InputMode::Normal;
     }
 }
 
@@ -144,6 +197,17 @@ fn handle_normal(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
             app.tabs.current_mut().search_prev();
         }
 
+        // ── URL edit ──────────────────────────────────────────────────────────
+        (KeyModifiers::NONE, KeyCode::Char('o')) => {
+            let url = app.tabs.current().url.clone();
+            app.input_mode = InputMode::Url(url);
+        }
+
+        // ── Link hints ────────────────────────────────────────────────────────
+        (KeyModifiers::NONE, KeyCode::Char('f')) => {
+            app.enter_hint_mode();
+        }
+
         _ => {}
     }
 }
@@ -179,5 +243,45 @@ mod tests {
         handle_search(key, &mut app);
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.tabs.current().search_matches.is_empty());
+    }
+
+    #[test]
+    fn url_mode_char_appends() {
+        let mut app = make_app();
+        app.input_mode = InputMode::Url("https://".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(&app.input_mode, InputMode::Url(s) if s == "https://x"));
+    }
+
+    #[test]
+    fn url_mode_backspace_pops() {
+        let mut app = make_app();
+        app.input_mode = InputMode::Url("https://abc".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(&app.input_mode, InputMode::Url(s) if s == "https://ab"));
+    }
+
+    #[test]
+    fn url_mode_esc_returns_normal() {
+        let mut app = make_app();
+        app.input_mode = InputMode::Url("https://foo.com".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn url_mode_ctrl_w_clears_last_segment() {
+        let mut app = make_app();
+        app.input_mode = InputMode::Url("https://example.com/foo/bar".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle(key, &mut app, &tx);
+        assert!(matches!(&app.input_mode, InputMode::Url(s) if s == "https://example.com/foo/"));
     }
 }
