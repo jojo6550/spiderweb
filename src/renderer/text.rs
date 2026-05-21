@@ -2,6 +2,7 @@
 
 use scraper::{ElementRef, Node};
 
+use crate::parser::css::{self, HiddenSet};
 use crate::parser::html::ParsedPage;
 
 const BLOCK: &[&str] = &[
@@ -72,15 +73,17 @@ impl Ctx {
 
 /// Render `page` to a terminal-ready ANSI string.
 pub fn render(page: &ParsedPage) -> String {
+    let hidden = css::extract_hidden(page.document());
     let mut ctx = Ctx::new();
-    render_element(page.document().root_element(), &mut ctx);
+    render_element(page.document().root_element(), &mut ctx, &hidden);
     normalize(&ctx.buf)
 }
 
 /// Render `page` to plain-text lines with link position metadata.
 pub fn render_full(page: &ParsedPage) -> RenderedPage {
+    let hidden = css::extract_hidden(page.document());
     let mut ctx = Ctx::new();
-    render_element(page.document().root_element(), &mut ctx);
+    render_element(page.document().root_element(), &mut ctx, &hidden);
     let normalized = normalize(&ctx.buf);
     let lines: Vec<String> = strip_ansi(&normalized).lines().map(str::to_owned).collect();
 
@@ -119,10 +122,10 @@ pub fn strip_ansi(s: &str) -> String {
 
 // ── Internal render functions ─────────────────────────────────────────────────
 
-fn render_element(el: ElementRef<'_>, ctx: &mut Ctx) {
+fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
     let tag = el.value().name();
 
-    if SKIP.contains(&tag) {
+    if SKIP.contains(&tag) || is_hidden(el, hidden) {
         return;
     }
 
@@ -156,10 +159,13 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx) {
             }
             Node::Element(_) => {
                 if let Some(child_el) = ElementRef::wrap(child) {
+                    if is_hidden(child_el, hidden) {
+                        continue;
+                    }
                     match child_el.value().name() {
                         "a" => render_link(child_el, ctx),
                         "img" => render_img(child_el, ctx),
-                        _ => render_element(child_el, ctx),
+                        _ => render_element(child_el, ctx, hidden),
                     }
                 }
             }
@@ -174,6 +180,45 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx) {
     if is_block {
         ctx.push_char('\n');
     }
+}
+
+/// `true` if the element should be skipped due to inline style, attribute, or
+/// CSS rule indicating it's invisible.
+fn is_hidden(el: ElementRef<'_>, hidden: &HiddenSet) -> bool {
+    let val = el.value();
+
+    if val.attr("hidden").is_some() {
+        return true;
+    }
+    if val.attr("aria-hidden") == Some("true") {
+        return true;
+    }
+    if let Some(style) = val.attr("style") {
+        let lower = style.to_ascii_lowercase();
+        if lower.contains("display:none")
+            || lower.contains("display: none")
+            || lower.contains("visibility:hidden")
+            || lower.contains("visibility: hidden")
+        {
+            return true;
+        }
+    }
+    if hidden.tags.contains(val.name()) {
+        return true;
+    }
+    if let Some(id) = val.attr("id") {
+        if hidden.ids.contains(id) {
+            return true;
+        }
+    }
+    if let Some(class_attr) = val.attr("class") {
+        for cls in class_attr.split_whitespace() {
+            if hidden.classes.contains(cls) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn render_img(el: ElementRef<'_>, ctx: &mut Ctx) {
@@ -285,6 +330,47 @@ mod tests {
         let rp = render_full(&page);
         assert!(!rp.links.is_empty());
         assert_eq!(rp.links[0].href, "https://a.com");
+    }
+
+    #[test]
+    fn hidden_attribute_skipped() {
+        let page = ParsedPage::parse_html(
+            "<html><body><p>Shown</p><p hidden>Hidden</p></body></html>",
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Shown"));
+        assert!(!plain.contains("Hidden"), "got: {plain:?}");
+    }
+
+    #[test]
+    fn inline_display_none_skipped() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><p>Shown</p><div style="display: none">Gone</div></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Shown"));
+        assert!(!plain.contains("Gone"), "got: {plain:?}");
+    }
+
+    #[test]
+    fn css_style_block_hides_class() {
+        let page = ParsedPage::parse_html(
+            r#"<html><head><style>.junk { display:none; }</style></head>
+            <body><p>Shown</p><div class="junk">Gone</div></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Shown"));
+        assert!(!plain.contains("Gone"), "got: {plain:?}");
+    }
+
+    #[test]
+    fn sr_only_class_hidden_by_default() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><span class="sr-only">screen reader</span><p>Visible</p></body></html>"#,
+        );
+        let plain = strip_ansi(&render(&page));
+        assert!(plain.contains("Visible"));
+        assert!(!plain.contains("screen reader"), "got: {plain:?}");
     }
 
     #[test]
