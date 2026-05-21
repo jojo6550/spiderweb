@@ -218,14 +218,14 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
                         if let Ok(i) = digits.parse::<usize>() {
                             if let Some(cs) = code_spans.get_mut(i) {
                                 cs.line = line_idx;
-                                cs.start = buf.len();
+                                cs.start = buf.chars().count();
                             }
                         }
                     }
                     'Z' => {
                         if let Ok(i) = digits.parse::<usize>() {
                             if let Some(cs) = code_spans.get_mut(i) {
-                                cs.end = buf.len();
+                                cs.end = buf.chars().count();
                             }
                         }
                     }
