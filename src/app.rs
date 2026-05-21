@@ -19,7 +19,7 @@ use crate::{
     parser::{html::ParsedPage, layout},
     renderer::{
         image as image_renderer,
-        text::{self as text_renderer, RenderedImage, RenderedLink},
+        text::{self as text_renderer, FormField, RenderedForm, RenderedImage, RenderedLink},
     },
     tui::{keybinds, ui},
 };
@@ -35,6 +35,9 @@ pub enum InputMode {
     Url(String),
     /// Hint mode — string is the typed hint letters so far.
     Hint(String),
+    /// Form-field edit mode. `field_idx` is the index into `tab.fields`;
+    /// `buffer` is the live value being typed.
+    FieldEdit { field_idx: usize, buffer: String },
 }
 
 // ── Background message ────────────────────────────────────────────────────────
@@ -49,6 +52,8 @@ pub enum BgMsg {
         links: Vec<RenderedLink>,
         line_kinds: Vec<text_renderer::LineKind>,
         code_spans: Vec<text_renderer::CodeSpan>,
+        forms: Vec<RenderedForm>,
+        fields: Vec<FormField>,
     },
     Error {
         tab_idx: usize,
@@ -68,10 +73,17 @@ pub struct App {
     pub input_mode: InputMode,
     /// Hint codes for link-hint mode: (link_index, 2-letter code).
     pub hint_codes: Vec<(usize, String)>,
+    /// HTTP client shared across the session — built once at startup.
+    pub client: SpiderClient,
 }
 
 impl App {
-    pub fn new(url: String, settings: Settings, bookmarks: Bookmarks) -> Self {
+    pub fn new(
+        url: String,
+        settings: Settings,
+        bookmarks: Bookmarks,
+        client: SpiderClient,
+    ) -> Self {
         Self {
             tabs: TabManager::new(url),
             bookmarks,
@@ -80,6 +92,7 @@ impl App {
             quit: false,
             input_mode: InputMode::Normal,
             hint_codes: Vec::new(),
+            client,
         }
     }
 
@@ -113,7 +126,9 @@ impl App {
 
     pub fn handle_msg(&mut self, msg: BgMsg) {
         match msg {
-            BgMsg::Loaded { tab_idx, url, title, lines, links, line_kinds, code_spans } => {
+            BgMsg::Loaded {
+                tab_idx, url, title, lines, links, line_kinds, code_spans, forms, fields,
+            } => {
                 if let Some(tab) = self.tabs.tabs.get_mut(tab_idx) {
                     tab.url = url;
                     tab.title = title.unwrap_or_default();
@@ -121,6 +136,10 @@ impl App {
                     tab.links = links;
                     tab.line_kinds = line_kinds;
                     tab.code_spans = code_spans;
+                    tab.field_values =
+                        fields.iter().map(|f| f.value.clone()).collect();
+                    tab.forms = forms;
+                    tab.fields = fields;
                     tab.scroll = 0;
                     tab.selected_link = None;
                     tab.loading = false;
@@ -157,7 +176,7 @@ impl App {
         tab.clear_search();
         self.status.clear();
         let tab_idx = self.tabs.active;
-        tokio::spawn(fetch_page(url, tab_idx, tx.clone()));
+        tokio::spawn(fetch_page(url, tab_idx, tx.clone(), self.client.clone()));
     }
 
     pub fn go_back(&mut self, tx: &Sender<BgMsg>) {
@@ -170,7 +189,7 @@ impl App {
             tab.selected_link = None;
             tab.clear_search();
             self.status.clear();
-            tokio::spawn(fetch_page(prev, tab_idx, tx.clone()));
+            tokio::spawn(fetch_page(prev, tab_idx, tx.clone(), self.client.clone()));
         } else {
             self.status = "No history".into();
         }
@@ -186,7 +205,7 @@ impl App {
             tab.selected_link = None;
             tab.clear_search();
             self.status.clear();
-            tokio::spawn(fetch_page(next, tab_idx, tx.clone()));
+            tokio::spawn(fetch_page(next, tab_idx, tx.clone(), self.client.clone()));
         } else {
             self.status = "No forward history".into();
         }
@@ -200,7 +219,33 @@ impl App {
             return;
         };
         let tab_idx = self.tabs.open_new(url.clone());
-        tokio::spawn(fetch_page(url, tab_idx, tx.clone()));
+        tokio::spawn(fetch_page(url, tab_idx, tx.clone(), self.client.clone()));
+    }
+
+    /// Submit form `form_idx` of the current tab via GET: build a query string
+    /// from named (non-Submit) fields' values and navigate to `action?query`.
+    /// Empty `action` resolves to the current URL stripped of any existing query.
+    pub fn submit_form(&mut self, form_idx: usize, tx: &Sender<BgMsg>) {
+        let tab = self.tabs.current();
+        let Some(form) = tab.forms.get(form_idx) else {
+            self.status = "No such form".into();
+            return;
+        };
+        let action = form.action.clone();
+        let query = tab.build_query(form_idx);
+        let base = tab.url.clone();
+        let target_base = if action.is_empty() {
+            current_url_without_query(&base)
+        } else {
+            action
+        };
+        let href = if query.is_empty() {
+            target_base
+        } else {
+            let sep = if target_base.contains('?') { '&' } else { '?' };
+            format!("{target_base}{sep}{query}")
+        };
+        self.navigate(href, tx);
     }
 
     /// Toggle bookmark for the current tab's URL; persists immediately.
@@ -255,18 +300,31 @@ fn resolve_url(base: &str, href: &str) -> Option<String> {
     url::Url::parse(base).ok()?.join(href).ok().map(|u| u.to_string())
 }
 
+/// Return `base` with any `?query` and `#fragment` stripped. Used for form
+/// submissions whose `action` attribute is empty (HTML default: post to self,
+/// minus query). Falls back to `base` if parsing fails.
+fn current_url_without_query(base: &str) -> String {
+    match url::Url::parse(base) {
+        Ok(mut u) => {
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => base.to_owned(),
+    }
+}
+
 // ── Fetch task ────────────────────────────────────────────────────────────────
 
-async fn fetch_page(url: String, tab_idx: usize, tx: Sender<BgMsg>) {
-    let msg = fetch_inner(&url, tab_idx).await.unwrap_or_else(|e| BgMsg::Error {
+async fn fetch_page(url: String, tab_idx: usize, tx: Sender<BgMsg>, client: SpiderClient) {
+    let msg = fetch_inner(&url, tab_idx, client).await.unwrap_or_else(|e| BgMsg::Error {
         tab_idx,
         message: e.to_string(),
     });
     let _ = tx.send(msg).await;
 }
 
-async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
-    let client = SpiderClient::new()?;
+async fn fetch_inner(url: &str, tab_idx: usize, client: SpiderClient) -> Result<BgMsg> {
     let resp = client.fetch(url).await?;
 
     struct PageData {
@@ -276,43 +334,59 @@ async fn fetch_inner(url: &str, tab_idx: usize) -> Result<BgMsg> {
         images: Vec<RenderedImage>,
         line_kinds: Vec<text_renderer::LineKind>,
         code_spans: Vec<text_renderer::CodeSpan>,
+        forms: Vec<RenderedForm>,
+        fields: Vec<FormField>,
     }
 
-    let PageData { mut lines, mut links, title, mut images, mut line_kinds, code_spans } =
-        if resp.is_html() {
-            let page = ParsedPage::from_bytes(&resp.body);
-            let title = page.title();
-            let r = text_renderer::render_full(&page);
-            PageData {
-                lines: r.lines,
-                links: r.links,
-                title,
-                images: r.images,
-                line_kinds: r.line_kinds,
-                code_spans: r.code_spans,
-            }
-        } else if resp.is_text() {
-            let text = String::from_utf8_lossy(&resp.body);
-            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-            let line_kinds = vec![text_renderer::LineKind::Normal; lines.len()];
-            PageData { lines, links: Vec::new(), title: None, images: Vec::new(), line_kinds, code_spans: Vec::new() }
-        } else {
-            let ct = resp.content_type.as_deref().unwrap_or("binary");
-            let lines = vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
-            PageData { lines, links: Vec::new(), title: None, images: Vec::new(), line_kinds: vec![text_renderer::LineKind::Normal], code_spans: Vec::new() }
-        };
+    let PageData {
+        mut lines, mut links, title, mut images, mut line_kinds, code_spans, forms, mut fields,
+    } = if resp.is_html() {
+        let page = ParsedPage::from_bytes(&resp.body);
+        let title = page.title();
+        let r = text_renderer::render_full(&page);
+        PageData {
+            lines: r.lines,
+            links: r.links,
+            title,
+            images: r.images,
+            line_kinds: r.line_kinds,
+            code_spans: r.code_spans,
+            forms: r.forms,
+            fields: r.fields,
+        }
+    } else if resp.is_text() {
+        let text = String::from_utf8_lossy(&resp.body);
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let line_kinds = vec![text_renderer::LineKind::Normal; lines.len()];
+        PageData {
+            lines, links: Vec::new(), title: None, images: Vec::new(),
+            line_kinds, code_spans: Vec::new(), forms: Vec::new(), fields: Vec::new(),
+        }
+    } else {
+        let ct = resp.content_type.as_deref().unwrap_or("binary");
+        let lines = vec![format!("[{ct} — {} bytes — not renderable]", resp.body.len())];
+        PageData {
+            lines, links: Vec::new(), title: None, images: Vec::new(),
+            line_kinds: vec![text_renderer::LineKind::Normal], code_spans: Vec::new(),
+            forms: Vec::new(), fields: Vec::new(),
+        }
+    };
 
     if !images.is_empty() {
         inline_images(&mut lines, &mut links, &images, url, &client).await;
     }
 
     // Word-wrap text lines to readable width; preserves image lines as-is.
-    lines = layout::wrap_lines(lines, &mut links, &mut images, layout::DEFAULT_WIDTH);
+    lines = layout::wrap_lines(
+        lines, &mut links, &mut images, &mut fields, layout::DEFAULT_WIDTH,
+    );
 
     // Sync line_kinds length after wrapping (new wrapped lines default to Normal).
     line_kinds.resize(lines.len(), text_renderer::LineKind::Normal);
 
-    Ok(BgMsg::Loaded { tab_idx, url: url.to_owned(), title, lines, links, line_kinds, code_spans })
+    Ok(BgMsg::Loaded {
+        tab_idx, url: url.to_owned(), title, lines, links, line_kinds, code_spans, forms, fields,
+    })
 }
 
 /// Fetch images concurrently (shared client), convert to ANSI half-block lines,
@@ -406,10 +480,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 pub async fn run(url: String) -> Result<()> {
     let settings = Settings::load().unwrap_or_default();
     let bookmarks = Bookmarks::load().unwrap_or_else(|_| Bookmarks::empty());
+    let client = SpiderClient::new()?;
 
     let (tx, mut rx) = mpsc::channel::<BgMsg>(8);
-    let mut app = App::new(url.clone(), settings, bookmarks);
-    tokio::spawn(fetch_page(url, 0, tx.clone()));
+    let mut app = App::new(url.clone(), settings, bookmarks, client.clone());
+    tokio::spawn(fetch_page(url, 0, tx.clone(), client));
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -463,7 +538,13 @@ mod tests {
     use super::*;
 
     fn make_app() -> App {
-        App::new("https://example.com".into(), Settings::default(), Bookmarks::empty())
+        let client = SpiderClient::new().expect("client should build");
+        App::new(
+            "https://example.com".into(),
+            Settings::default(),
+            Bookmarks::empty(),
+            client,
+        )
     }
 
     #[test]

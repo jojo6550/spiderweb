@@ -11,7 +11,77 @@ pub fn handle(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
         InputMode::Search(_) => handle_search(key, app),
         InputMode::Url(_) => handle_url(key, app, tx),
         InputMode::Hint(_) => handle_hint(key, app, tx),
+        InputMode::FieldEdit { .. } => handle_field_edit(key, app, tx),
         InputMode::Normal => handle_normal(key, app, tx),
+    }
+}
+
+/// Commit the buffer back onto the tab's `field_values`. No-op if `field_idx`
+/// is out of range (e.g. page reloaded mid-edit).
+fn commit_field_buffer(app: &mut App, field_idx: usize, buffer: String) {
+    let tab = app.tabs.current_mut();
+    if let Some(slot) = tab.field_values.get_mut(field_idx) {
+        *slot = buffer;
+    }
+}
+
+fn handle_field_edit(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
+    let (field_idx, buffer) = match &app.input_mode {
+        InputMode::FieldEdit { field_idx, buffer } => (*field_idx, buffer.clone()),
+        _ => return,
+    };
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            // Discard buffer.
+            app.input_mode = InputMode::Normal;
+        }
+        (KeyModifiers::NONE, KeyCode::Enter) => {
+            commit_field_buffer(app, field_idx, buffer);
+            let form_idx = app
+                .tabs
+                .current()
+                .fields
+                .get(field_idx)
+                .map(|f| f.form_idx);
+            app.input_mode = InputMode::Normal;
+            if let Some(fi) = form_idx {
+                app.submit_form(fi, tx);
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Tab) => {
+            commit_field_buffer(app, field_idx, buffer);
+            let next = app.tabs.current().next_editable_field(Some(field_idx));
+            match next {
+                Some(n) => {
+                    let new_buf = app
+                        .tabs
+                        .current()
+                        .field_values
+                        .get(n)
+                        .cloned()
+                        .unwrap_or_default();
+                    // Keep the next field visible.
+                    if let Some(line) = app.tabs.current().fields.get(n).map(|f| f.line) {
+                        app.tabs.current_mut().scroll = line;
+                    }
+                    app.input_mode = InputMode::FieldEdit { field_idx: n, buffer: new_buf };
+                }
+                None => {
+                    app.input_mode = InputMode::Normal;
+                }
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Backspace) => {
+            let mut b = buffer;
+            b.pop();
+            app.input_mode = InputMode::FieldEdit { field_idx, buffer: b };
+        }
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+            let mut b = buffer;
+            b.push(c);
+            app.input_mode = InputMode::FieldEdit { field_idx, buffer: b };
+        }
+        _ => {}
     }
 }
 
@@ -255,6 +325,29 @@ fn handle_normal(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
             app.enter_hint_mode();
         }
 
+        // ── Forms ─────────────────────────────────────────────────────────────
+        (KeyModifiers::NONE, KeyCode::Char('i')) => {
+            let next = app.tabs.current().next_editable_field(None);
+            match next {
+                Some(idx) => {
+                    let buffer = app
+                        .tabs
+                        .current()
+                        .field_values
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(line) = app.tabs.current().fields.get(idx).map(|f| f.line) {
+                        app.tabs.current_mut().scroll = line;
+                    }
+                    app.input_mode = InputMode::FieldEdit { field_idx: idx, buffer };
+                }
+                None => {
+                    app.status = "No editable form field on this page".into();
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -262,13 +355,18 @@ fn handle_normal(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{browser::bookmarks::Bookmarks, config::settings::Settings};
+    use crate::{
+        browser::bookmarks::Bookmarks, config::settings::Settings,
+        network::client::SpiderClient,
+    };
 
     fn make_app() -> App {
+        let client = SpiderClient::new().expect("client");
         crate::app::App::new(
             "https://example.com".into(),
             Settings::default(),
             Bookmarks::empty(),
+            client,
         )
     }
 
@@ -353,5 +451,84 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
         handle(key, &mut app, &tx);
         assert!(matches!(&app.input_mode, InputMode::Url(s) if s == "https://example.com/foo/"));
+    }
+
+    fn app_with_search_form() -> crate::app::App {
+        use crate::renderer::text::{FieldKind, FormField, RenderedForm};
+        let mut app = make_app();
+        let tab = app.tabs.current_mut();
+        tab.loading = false;
+        tab.forms = vec![RenderedForm { action: "/search".into(), method: "get".into() }];
+        tab.fields = vec![FormField {
+            form_idx: 0,
+            name: "q".into(),
+            kind: FieldKind::Text,
+            value: String::new(),
+            line: 3,
+        }];
+        tab.field_values = vec![String::new()];
+        app
+    }
+
+    #[test]
+    fn i_key_enters_field_edit_on_text_input() {
+        let mut app = app_with_search_form();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::FieldEdit { field_idx: 0, buffer } if buffer.is_empty()
+        ));
+    }
+
+    #[test]
+    fn i_key_with_no_form_sets_status() {
+        let mut app = make_app();
+        app.tabs.current_mut().loading = false;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(!app.status.is_empty());
+    }
+
+    #[test]
+    fn field_edit_typing_appends_to_buffer() {
+        let mut app = app_with_search_form();
+        app.input_mode = InputMode::FieldEdit { field_idx: 0, buffer: String::new() };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        for c in "hi".chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            handle(key, &mut app, &tx);
+        }
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::FieldEdit { buffer, .. } if buffer == "hi"
+        ));
+    }
+
+    #[test]
+    fn field_edit_esc_discards_buffer() {
+        let mut app = app_with_search_form();
+        app.input_mode = InputMode::FieldEdit { field_idx: 0, buffer: "draft".into() };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.tabs.current().field_values[0], "");
+    }
+
+    #[test]
+    fn field_edit_backspace_pops() {
+        let mut app = app_with_search_form();
+        app.input_mode = InputMode::FieldEdit { field_idx: 0, buffer: "abc".into() };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        handle(key, &mut app, &tx);
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::FieldEdit { buffer, .. } if buffer == "ab"
+        ));
     }
 }

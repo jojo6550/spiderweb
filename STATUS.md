@@ -2,10 +2,10 @@
 
 Current state of the terminal browser. Update this file at the end of each working session so the next Claude can pick up cold.
 
-**Last updated:** 2026-05-20
+**Last updated:** 2026-05-21
 **Branch:** main
-**Build:** clean — 68 tests pass, zero clippy warnings (`cargo clippy --all-targets -- -D warnings`)
-**Verified:** runs against `https://example.com` end-to-end (heading + body + word-wrap + link + tab bar + search mode confirmed via captured VT output on Windows)
+**Build:** clean — 102 tests pass, zero clippy warnings (`cargo clippy --all-targets -- -D warnings`)
+**Verified:** runs against `https://example.com` end-to-end (heading + body + word-wrap + link + tab bar + new `i:input` hint confirmed via captured VT output on Windows)
 
 ---
 
@@ -43,7 +43,7 @@ All of these landed across commits `a1a3578` … `c46664f`:
 
 ### What's NOT done in Phase 2
 
-- **Form submission** (`<form action="..." method="GET">`) — visual rendering works, no input editing mode, no URL building from inputs. Deferred to Phase 3 alongside streaming render.
+- **Form submission** (`<form action="..." method="GET">`) — visual rendering works, no input editing mode, no URL building from inputs. Deferred to Phase 3 alongside streaming render. **DONE in Phase 3 — see below.**
 
 ---
 
@@ -60,18 +60,22 @@ All of these landed across commits `a1a3578` … `c46664f`:
 
 ---
 
-## Phase 3 — Media & Performance — NOT STARTED
+## Phase 3 — Media & Performance — IN PROGRESS
 
-Priority order, biggest user-visible win first:
+### DONE in this slice
+1. **Form submission (GET).** Renderer emits `RenderedForm` + `FormField` per `<form>`. Per-tab `field_values`. New `InputMode::FieldEdit { field_idx, buffer }`. Keybinds: `i` (normal) opens edit mode on the first text/textarea field; in edit mode, **Tab** = commit + next field, **Enter** = commit + submit, **Backspace** = pop char, **Esc** = discard. `App::submit_form` URL-encodes named (non-Submit) fields with `url::form_urlencoded`, resolves an empty `action` to the current URL stripped of its query, and navigates via the existing history-aware `navigate` path. Hidden inputs registered inside `<form>` via `register_hidden_fields` so CSRF/state tokens travel with the GET request. UI: pink `INPUT` mode badge + bottom prompt bar `✎ name: buffer█`.
+2. **Shared `SpiderClient`.** Built once in `run()`, owned by `App`, cloned into every `fetch_page` call. No more rustls/TCP-pool churn per navigation. `fetch_inner` takes a `client: SpiderClient` parameter; image-inline path still uses the same client (continued behaviour from Phase 2).
 
-1. **Form submission** (close out Phase 2 leftover) — input editing mode (`InputMode::FormField`), per-tab form state keyed by `name`, build GET query string on submit-button Enter, navigate to `action` URL + `?k=v`. ~2-4 hours.
-2. **Streaming HTML render** — begin painting before full response body arrives. `reqwest` already streams; need to chunk-parse and incrementally feed renderer. Fixes Wikipedia stall. Bigger lift.
-3. **Connection pooling + DNS cache** — `SpiderClient` lives in `App` instead of being built per fetch. `dns` module currently empty — add resolver config + caching.
-4. **`renderer/video.rs`** — FFmpeg frame pipeline, Sixel/Kitty output at target fps. `ffmpeg-next` crate. CLAUDE.md spec.
-5. **GIF animation** — `image` crate decodes GIF frames; loop with timing.
-6. **SIMD Sixel encoder** — replace `viuer` with custom impl. Currently only used for direct image URLs (not inline rendering, which uses half-block).
-7. **HTTP cache** — ETag, Cache-Control, disk-backed under `~/.config/spiderweb/cache/`.
-8. **Parallel asset fetching done partially** — image fetches already use `join_all` with shared client. CSS/JS/font assets would extend the same pattern.
+Touched files: `src/app.rs`, `src/renderer/text.rs`, `src/parser/layout.rs` (new `fields` arg to `wrap_lines`), `src/browser/tabs.rs`, `src/tui/keybinds.rs`, `src/tui/ui.rs`. ~+10 unit tests across the modules (102 total, all green).
+
+### Still TODO in Phase 3, priority order
+1. **Streaming HTML render** — begin painting before full response body arrives. `reqwest` already streams; need to chunk-parse and incrementally feed renderer. Fixes Wikipedia stall. Bigger lift.
+2. **DNS cache** — `dns` module still empty. Add a resolver + cache (e.g. `hickory-resolver` or a hand-rolled TTL map) and plug into `reqwest::ClientBuilder::dns_resolver`.
+3. **`renderer/video.rs`** — FFmpeg frame pipeline, Sixel/Kitty output at target fps. `ffmpeg-next` crate. CLAUDE.md spec.
+4. **GIF animation** — `image` crate decodes GIF frames; loop with timing.
+5. **SIMD Sixel encoder** — replace `viuer` with custom impl. Currently only used for direct image URLs (not inline rendering, which uses half-block).
+6. **HTTP cache** — ETag, Cache-Control, disk-backed under `~/.config/spiderweb/cache/`.
+7. **Form: POST + non-text field editing** — current slice supports text/textarea editing only. Checkbox toggle, radio select, `<select>` cycling, and `method="post"` (with body building) are all natural extensions.
 
 ---
 
@@ -141,3 +145,7 @@ bc76a9c feat(layout,forms): word-wrap + form element rendering — Phase 2 compl
 88ea1ee fix(renderer): hide inline hrefs from rendered output
 a1a3578 feat(phase2): tabs, history, bookmarks, search, relative URL resolution
 ```
+
+## Commit History — Phase 3 (in progress)
+
+Form submission + shared client landed locally; commit pending user review.

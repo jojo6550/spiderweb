@@ -55,13 +55,54 @@ pub struct CodeSpan {
     pub end: usize,   // char offset in stripped line (exclusive)
 }
 
-/// Full render result: plain-text lines plus link/image metadata.
+/// A `<form>` element parsed from the page; metadata required to submit.
+#[derive(Debug, Clone)]
+pub struct RenderedForm {
+    /// `action` attribute. Empty = post to current URL (minus its query string).
+    pub action: String,
+    /// `method` attribute lowercased. `"get"` (default) or `"post"`.
+    pub method: String,
+}
+
+/// A form input/field belonging to a [`RenderedForm`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Single-line text inputs (text/search/email/url/tel/number/password/no-type).
+    Text,
+    Checkbox,
+    Radio,
+    Submit,
+    Textarea,
+    /// `<select>`. Stores its option labels for cycling later.
+    Select(Vec<String>),
+    /// `<input type="hidden">` — invisible but included in the query string.
+    Hidden,
+}
+
+/// A single form control. `value` is the initial/default; the runtime keeps a
+/// parallel `field_values` buffer that diverges from this on edits.
+#[derive(Debug, Clone)]
+pub struct FormField {
+    /// Index into [`RenderedPage::forms`].
+    pub form_idx: usize,
+    /// `name` attribute. Empty = unnamed (skipped at submit time, per HTML).
+    pub name: String,
+    pub kind: FieldKind,
+    /// Default value. For text/textarea: the `value`/innerText. For checkbox/radio: the `value` attr.
+    pub value: String,
+    /// Zero-based line index in the rendered output. Hidden fields keep `0`.
+    pub line: usize,
+}
+
+/// Full render result: plain-text lines plus link/image/form metadata.
 pub struct RenderedPage {
     pub lines: Vec<String>,
     pub links: Vec<RenderedLink>,
     pub images: Vec<RenderedImage>,
     pub line_kinds: Vec<LineKind>,
     pub code_spans: Vec<CodeSpan>,
+    pub forms: Vec<RenderedForm>,
+    pub fields: Vec<FormField>,
 }
 
 // ── Render context ────────────────────────────────────────────────────────────
@@ -76,6 +117,10 @@ struct Ctx {
     links: Vec<RenderedLink>,
     images: Vec<RenderedImage>,
     code_spans: Vec<CodeSpan>,
+    forms: Vec<RenderedForm>,
+    fields: Vec<FormField>,
+    /// Index of the enclosing `<form>` during recursion, if any.
+    current_form: Option<usize>,
 }
 
 impl Ctx {
@@ -85,6 +130,9 @@ impl Ctx {
             links: Vec::new(),
             images: Vec::new(),
             code_spans: Vec::new(),
+            forms: Vec::new(),
+            fields: Vec::new(),
+            current_form: None,
         }
     }
 
@@ -141,6 +189,30 @@ impl Ctx {
         self.buf.push_str(&idx.to_string());
         self.buf.push(MARKER);
     }
+
+    /// Push a form-field position marker for field index `idx`.
+    fn push_field_marker(&mut self, idx: usize) {
+        self.buf.push(MARKER);
+        self.buf.push('F');
+        self.buf.push_str(&idx.to_string());
+        self.buf.push(MARKER);
+    }
+
+    /// Register a [`FormField`] under the current form (if any). Returns the
+    /// index of the new field, or `None` if not inside a `<form>`. Hidden
+    /// fields are registered but emit no marker (no visible position).
+    fn register_field(&mut self, name: String, kind: FieldKind, value: String) -> Option<usize> {
+        let form_idx = self.current_form?;
+        let idx = self.fields.len();
+        self.fields.push(FormField {
+            form_idx,
+            name,
+            kind,
+            value,
+            line: 0,
+        });
+        Some(idx)
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -186,6 +258,8 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
     let mut links = ctx.links;
     let mut images = ctx.images;
     let mut code_spans = ctx.code_spans;
+    let mut fields = ctx.fields;
+    let forms = ctx.forms;
     let mut line_kinds = vec![LineKind::Normal; lines.len()];
 
     // Scan each line for markers; record positions, then strip markers.
@@ -257,6 +331,13 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
                             }
                         }
                     }
+                    'F' => {
+                        if let Ok(idx) = digits.parse::<usize>() {
+                            if let Some(f) = fields.get_mut(idx) {
+                                f.line = line_idx;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             } else {
@@ -267,7 +348,7 @@ pub fn render_full(page: &ParsedPage) -> RenderedPage {
         *line = buf;
     }
 
-    RenderedPage { lines, links, images, line_kinds, code_spans }
+    RenderedPage { lines, links, images, line_kinds, code_spans, forms, fields }
 }
 
 /// Strip ANSI escape sequences from a string.
@@ -301,6 +382,24 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
     }
 
     let is_block = BLOCK.contains(&tag);
+
+    // Open a new form scope, register it, and gather any hidden inputs that
+    // sit inside (so they make it into the submit query string). Nested forms
+    // are illegal HTML; we save+restore the outer scope just in case.
+    let saved_form = if tag == "form" {
+        let form_idx = ctx.forms.len();
+        let val = el.value();
+        ctx.forms.push(RenderedForm {
+            action: val.attr("action").unwrap_or("").to_owned(),
+            method: val.attr("method").unwrap_or("get").to_ascii_lowercase(),
+        });
+        let prev = ctx.current_form;
+        ctx.current_form = Some(form_idx);
+        register_hidden_fields(el, ctx);
+        Some(prev)
+    } else {
+        None
+    };
 
     if is_block {
         ctx.push_char('\n');
@@ -357,6 +456,28 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
 
     if is_block {
         ctx.push_char('\n');
+    }
+
+    if let Some(prev) = saved_form {
+        ctx.current_form = prev;
+    }
+}
+
+/// Register hidden inputs nested inside `form_el` (typed `input type="hidden"`).
+/// Hidden fields don't emit a marker — they have no visible line — but they
+/// must travel with the submit query string.
+fn register_hidden_fields(form_el: ElementRef<'_>, ctx: &mut Ctx) {
+    for desc in form_el.descendants().filter_map(ElementRef::wrap) {
+        if desc.value().name() != "input" {
+            continue;
+        }
+        let ty = desc.value().attr("type").unwrap_or("").to_ascii_lowercase();
+        if ty != "hidden" {
+            continue;
+        }
+        let name = desc.value().attr("name").unwrap_or("").to_owned();
+        let value = desc.value().attr("value").unwrap_or("").to_owned();
+        let _ = ctx.register_field(name, FieldKind::Hidden, value);
     }
 }
 
@@ -423,37 +544,66 @@ fn render_img(el: ElementRef<'_>, ctx: &mut Ctx) {
 fn render_input(el: ElementRef<'_>, ctx: &mut Ctx) {
     let val = el.value();
     let ty = val.attr("type").unwrap_or("text").to_ascii_lowercase();
+    let name = val.attr("name").unwrap_or("").to_owned();
+    let value = val.attr("value").unwrap_or("").to_owned();
     match ty.as_str() {
-        "hidden" => {}
+        "hidden" => {
+            // Already registered by `register_hidden_fields` during the
+            // enclosing `<form>` descent. Emit nothing visible.
+        }
         "submit" | "button" | "reset" => {
+            let field_idx = ctx.register_field(name, FieldKind::Submit, value.clone());
             let label = val.attr("value").unwrap_or("Submit");
+            if let Some(idx) = field_idx {
+                ctx.push_field_marker(idx);
+            }
             ctx.push_ansi("\x1b[7m ");
             ctx.push_str(label);
             ctx.push_ansi(" \x1b[0m ");
         }
         "checkbox" => {
+            let initial = if val.attr("checked").is_some() {
+                value.clone()
+            } else {
+                String::new()
+            };
+            let field_idx = ctx.register_field(name, FieldKind::Checkbox, initial);
             let mark = if val.attr("checked").is_some() { "[x]" } else { "[ ]" };
+            if let Some(idx) = field_idx {
+                ctx.push_field_marker(idx);
+            }
             ctx.push_str(mark);
             ctx.push_char(' ');
         }
         "radio" => {
+            let initial = if val.attr("checked").is_some() {
+                value.clone()
+            } else {
+                String::new()
+            };
+            let field_idx = ctx.register_field(name, FieldKind::Radio, initial);
             let mark = if val.attr("checked").is_some() { "(•)" } else { "( )" };
+            if let Some(idx) = field_idx {
+                ctx.push_field_marker(idx);
+            }
             ctx.push_str(mark);
             ctx.push_char(' ');
         }
         _ => {
-            let value = val.attr("value").unwrap_or("");
             let placeholder = val.attr("placeholder").unwrap_or("");
-            let name = val.attr("name").unwrap_or("");
             let label = if !value.is_empty() {
-                value.to_owned()
+                value.clone()
             } else if !placeholder.is_empty() {
                 placeholder.to_owned()
             } else if !name.is_empty() {
-                name.to_owned()
+                name.clone()
             } else {
                 "input".to_owned()
             };
+            let field_idx = ctx.register_field(name, FieldKind::Text, value);
+            if let Some(idx) = field_idx {
+                ctx.push_field_marker(idx);
+            }
             ctx.push_ansi("\x1b[2m[");
             ctx.push_str(&label);
             ctx.push_str(" __]\x1b[0m ");
@@ -462,33 +612,45 @@ fn render_input(el: ElementRef<'_>, ctx: &mut Ctx) {
 }
 
 fn render_button(el: ElementRef<'_>, ctx: &mut Ctx) {
+    let val = el.value();
+    let name = val.attr("name").unwrap_or("").to_owned();
+    let value = val.attr("value").unwrap_or("").to_owned();
+    // Default `<button>` is type=submit per HTML. type="button" gets the same
+    // Submit kind for now — its keypress is ignored at submit time anyway
+    // since we cycle to the actual submit field.
+    let field_idx = ctx.register_field(name, FieldKind::Submit, value);
     let text: String = el.text().collect();
-    let text = text.trim();
-    if text.is_empty() {
-        let label = el.value().attr("value").unwrap_or("Button");
-        ctx.push_ansi("\x1b[7m ");
-        ctx.push_str(label);
-        ctx.push_ansi(" \x1b[0m ");
-        return;
+    let text_trim = text.trim();
+    let label = if text_trim.is_empty() {
+        val.attr("value").unwrap_or("Button")
+    } else {
+        text_trim
+    };
+    if let Some(idx) = field_idx {
+        ctx.push_field_marker(idx);
     }
     ctx.push_ansi("\x1b[7m ");
-    ctx.push_str(text);
+    ctx.push_str(label);
     ctx.push_ansi(" \x1b[0m ");
 }
 
 fn render_textarea(el: ElementRef<'_>, ctx: &mut Ctx) {
     let val = el.value();
     let initial: String = el.text().collect();
-    let initial = initial.trim();
+    let initial_trim = initial.trim().to_owned();
     let placeholder = val.attr("placeholder").unwrap_or("");
-    let name = val.attr("name").unwrap_or("textarea");
-    let preview = if !initial.is_empty() {
-        initial.lines().next().unwrap_or("").to_owned()
+    let name = val.attr("name").unwrap_or("textarea").to_owned();
+    let preview = if !initial_trim.is_empty() {
+        initial_trim.lines().next().unwrap_or("").to_owned()
     } else if !placeholder.is_empty() {
         placeholder.to_owned()
     } else {
-        name.to_owned()
+        name.clone()
     };
+    let field_idx = ctx.register_field(name, FieldKind::Textarea, initial_trim);
+    if let Some(idx) = field_idx {
+        ctx.push_field_marker(idx);
+    }
     ctx.push_ansi("\x1b[2m[");
     ctx.push_str(&preview);
     ctx.push_str(" __]\x1b[0m ");
@@ -496,20 +658,34 @@ fn render_textarea(el: ElementRef<'_>, ctx: &mut Ctx) {
 
 fn render_select(el: ElementRef<'_>, ctx: &mut Ctx) {
     let mut chosen: Option<String> = None;
+    let mut options: Vec<String> = Vec::new();
+    let mut selected_value = String::new();
     for opt in el.children().filter_map(ElementRef::wrap) {
         if opt.value().name() != "option" {
             continue;
         }
         let text: String = opt.text().collect();
         let text = text.trim().to_owned();
+        let opt_val = opt
+            .value()
+            .attr("value")
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        options.push(text.clone());
         if opt.value().attr("selected").is_some() {
             chosen = Some(text);
-            break;
+            selected_value = opt_val;
         } else if chosen.is_none() {
-            chosen = Some(text);
+            chosen = Some(text.clone());
+            selected_value = opt_val;
         }
     }
+    let name = el.value().attr("name").unwrap_or("").to_owned();
     let label = chosen.unwrap_or_else(|| "▼".to_owned());
+    let field_idx = ctx.register_field(name, FieldKind::Select(options), selected_value);
+    if let Some(idx) = field_idx {
+        ctx.push_field_marker(idx);
+    }
     ctx.push_ansi("\x1b[2m[");
     ctx.push_str(&label);
     ctx.push_str(" ▼]\x1b[0m ");
@@ -829,5 +1005,60 @@ mod tests {
         );
         let rp = render_full(&page);
         assert_eq!(rp.code_spans.len(), 2);
+    }
+
+    #[test]
+    fn form_with_text_input_registered() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><form action="/search" method="get">
+                <input name="q" type="text" placeholder="Search">
+            </form></body></html>"#,
+        );
+        let rp = render_full(&page);
+        assert_eq!(rp.forms.len(), 1);
+        assert_eq!(rp.forms[0].action, "/search");
+        assert_eq!(rp.forms[0].method, "get");
+        assert_eq!(rp.fields.len(), 1);
+        assert_eq!(rp.fields[0].name, "q");
+        assert_eq!(rp.fields[0].kind, FieldKind::Text);
+        assert_eq!(rp.fields[0].form_idx, 0);
+    }
+
+    #[test]
+    fn hidden_input_inside_form_kept_as_field() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><form action="/x">
+                <input type="hidden" name="csrf" value="tok123">
+                <input name="q" type="text">
+            </form></body></html>"#,
+        );
+        let rp = render_full(&page);
+        // Order: register_hidden_fields runs first, then descent registers visible field.
+        let csrf = rp.fields.iter().find(|f| f.name == "csrf").expect("csrf field");
+        assert_eq!(csrf.kind, FieldKind::Hidden);
+        assert_eq!(csrf.value, "tok123");
+        // Visible render still strips the hidden value.
+        let plain = strip_ansi(&render(&page));
+        assert!(!plain.contains("tok123"));
+    }
+
+    #[test]
+    fn submit_button_recorded_as_submit_field() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><form><input type="submit" value="Go"></form></body></html>"#,
+        );
+        let rp = render_full(&page);
+        let submit = rp.fields.iter().find(|f| f.kind == FieldKind::Submit).expect("submit field");
+        assert_eq!(submit.value, "Go");
+    }
+
+    #[test]
+    fn fields_outside_form_not_registered() {
+        let page = ParsedPage::parse_html(
+            r#"<html><body><input name="x" type="text"></body></html>"#,
+        );
+        let rp = render_full(&page);
+        assert!(rp.fields.is_empty(), "fields outside <form> must not register");
+        assert!(rp.forms.is_empty());
     }
 }

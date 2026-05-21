@@ -4,7 +4,7 @@
 //! lines at word boundaries while preserving ANSI escape sequences and
 //! adjusting link/image line indices to the new wrapped layout.
 
-use crate::renderer::text::{RenderedImage, RenderedLink};
+use crate::renderer::text::{FormField, RenderedImage, RenderedLink};
 
 /// Default terminal width when none is supplied.
 pub const DEFAULT_WIDTH: usize = 100;
@@ -34,6 +34,7 @@ pub fn wrap_lines(
     lines: Vec<String>,
     links: &mut [RenderedLink],
     images: &mut [RenderedImage],
+    fields: &mut [FormField],
     max_width: usize,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -56,6 +57,11 @@ pub fn wrap_lines(
     for img in images.iter_mut() {
         if let Some(&new_idx) = index_map.get(img.line) {
             img.line = new_idx;
+        }
+    }
+    for field in fields.iter_mut() {
+        if let Some(&new_idx) = index_map.get(field.line) {
+            field.line = new_idx;
         }
     }
 
@@ -113,7 +119,8 @@ mod tests {
         let lines = vec!["short".to_owned()];
         let mut links = vec![];
         let mut images = vec![];
-        let out = wrap_lines(lines, &mut links, &mut images, 80);
+        let mut fields = vec![];
+        let out = wrap_lines(lines, &mut links, &mut images, &mut fields, 80);
         assert_eq!(out, vec!["short"]);
     }
 
@@ -122,7 +129,8 @@ mod tests {
         let lines = vec!["one two three four".to_owned()];
         let mut links = vec![];
         let mut images = vec![];
-        let out = wrap_lines(lines, &mut links, &mut images, 8);
+        let mut fields = vec![];
+        let out = wrap_lines(lines, &mut links, &mut images, &mut fields, 8);
         // "one two " (7 chars + space=8) → "one two", then "three", then "four"
         assert!(out.len() >= 2);
         for line in &out {
@@ -136,7 +144,8 @@ mod tests {
         let lines = vec![s.clone()];
         let mut links = vec![];
         let mut images = vec![];
-        let out = wrap_lines(lines, &mut links, &mut images, 40);
+        let mut fields = vec![];
+        let out = wrap_lines(lines, &mut links, &mut images, &mut fields, 40);
         assert_eq!(out.len(), 1, "ANSI lines must not be wrapped");
         assert_eq!(out[0], s);
     }
@@ -154,7 +163,8 @@ mod tests {
             line: 2, // originally pointing at "footer link line"
         }];
         let mut images = vec![];
-        let out = wrap_lines(lines, &mut links, &mut images, 20);
+        let mut fields = vec![];
+        let out = wrap_lines(lines, &mut links, &mut images, &mut fields, 20);
         // Line 1 wrapped into multiple — link should now be at first wrapped index of line 2.
         let footer_idx = out
             .iter()
@@ -168,7 +178,8 @@ mod tests {
         let lines = vec!["a".repeat(20)];
         let mut links = vec![];
         let mut images = vec![];
-        let out = wrap_lines(lines, &mut links, &mut images, 5);
+        let mut fields = vec![];
+        let out = wrap_lines(lines, &mut links, &mut images, &mut fields, 5);
         assert!(out.len() >= 4);
         for line in &out {
             assert!(visible_width(line) <= 5);

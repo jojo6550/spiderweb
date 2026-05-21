@@ -30,14 +30,15 @@ const C_PINK: Color = Color::Rgb(245, 194, 231);
 pub fn draw(frame: &mut Frame, app: &App) {
     let tab = app.tabs.current();
     let in_search = matches!(app.input_mode, InputMode::Search(_));
+    let in_field_edit = matches!(app.input_mode, InputMode::FieldEdit { .. });
 
-    // Tab bar (1) + address bar (1) + content (fill) + search? + status (1)
+    // Tab bar (1) + address bar (1) + content (fill) + bottom-input? + status (1)
     let mut constraints = vec![
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Fill(1),
     ];
-    if in_search {
+    if in_search || in_field_edit {
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Length(1));
@@ -65,6 +66,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .style(Style::new().bg(C_SURFACE0).fg(C_TEXT)),
             areas[3],
         );
+        status_idx = 4;
+    } else if in_field_edit {
+        if let InputMode::FieldEdit { field_idx, buffer } = &app.input_mode {
+            let name = tab
+                .fields
+                .get(*field_idx)
+                .map(|f| f.name.as_str())
+                .unwrap_or("input");
+            let label = if name.is_empty() { "input" } else { name };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" ✎ {label}: "),
+                    Style::new().bg(C_SURFACE1).fg(C_MAUVE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{buffer}█"),
+                    Style::new().bg(C_SURFACE1).fg(C_TEXT),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).style(Style::new().bg(C_SURFACE1)),
+                areas[3],
+            );
+        }
         status_idx = 4;
     }
 
@@ -156,12 +181,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         InputMode::Search(_) => ("SEARCH", C_RED),
         InputMode::Url(_) => ("URL", C_MAUVE),
         InputMode::Hint(_) => ("HINT", C_GREEN),
+        InputMode::FieldEdit { .. } => ("INPUT", C_PINK),
     };
     let hints = match &app.input_mode {
-        InputMode::Normal => " o:open  f:hints  /:search  b:bmark  j/k:scroll  t:tab  x:close",
+        InputMode::Normal => " o:open  f:hints  i:input  /:search  b:bmark  j/k:scroll  t:tab",
         InputMode::Search(_) => " Esc:cancel  Enter:done  n/N:next/prev",
         InputMode::Url(_) => " Enter:go  Esc:cancel  Ctrl+W:clear-word  Backspace:del",
         InputMode::Hint(_) => " type letters to follow  ·  Shift+letters:new tab  ·  Esc:cancel",
+        InputMode::FieldEdit { .. } => " Enter:submit  Tab:next-field  Esc:cancel",
     };
     let scroll_info = format!(" {}/{} ", tab.scroll + 1, tab.lines.len().max(1));
 
