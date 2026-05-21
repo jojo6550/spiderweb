@@ -116,6 +116,15 @@ impl Ctx {
         self.buf.push_str(&idx.to_string());
         self.buf.push(MARKER);
     }
+
+    /// Push a heading-level marker so `render_full` can tag the line with the
+    /// correct [`LineKind`] variant after normalization.
+    fn push_heading_marker(&mut self, level: usize) {
+        self.buf.push(MARKER);
+        self.buf.push('H');
+        self.buf.push_str(&level.to_string());
+        self.buf.push(MARKER);
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -270,15 +279,22 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
     }
 
     let is_block = BLOCK.contains(&tag);
-    let heading = heading_level(tag);
 
     if is_block {
         ctx.push_char('\n');
     }
 
     match tag {
-        "h1" => ctx.push_ansi("\x1b[1;34m"),
-        t if heading_level(t).is_some() => ctx.push_ansi("\x1b[1m"),
+        t if heading_level(t).is_some() => {
+            let level = heading_level(t).unwrap();
+            ctx.push_heading_marker(level);
+            match level {
+                1 => ctx.push_str("▌ "),
+                2 => ctx.push_str("  "),
+                3 => ctx.push_str("    "),
+                _ => ctx.push_str("      "),
+            }
+        }
         "li" => ctx.push_str("  • "),
         "hr" => {
             ctx.push_str("────────────────────────────────────────");
@@ -315,10 +331,6 @@ fn render_element(el: ElementRef<'_>, ctx: &mut Ctx, hidden: &HiddenSet) {
             }
             _ => {}
         }
-    }
-
-    if heading.is_some() || tag == "h1" {
-        ctx.push_ansi("\x1b[0m");
     }
 
     if is_block {
@@ -718,5 +730,45 @@ mod tests {
         let page = ParsedPage::parse_html("<html><body><p>Hello world</p></body></html>");
         let rp = render_full(&page);
         assert!(rp.code_spans.is_empty());
+    }
+
+    #[test]
+    fn h1_gets_linekind_h1() {
+        let page = ParsedPage::parse_html("<html><body><h1>Title</h1></body></html>");
+        let rp = render_full(&page);
+        let h1_idx = rp.lines.iter().position(|l| l.contains("Title")).unwrap();
+        assert_eq!(rp.line_kinds[h1_idx], LineKind::H1);
+    }
+
+    #[test]
+    fn h2_gets_linekind_h2() {
+        let page = ParsedPage::parse_html("<html><body><h2>Section</h2></body></html>");
+        let rp = render_full(&page);
+        let idx = rp.lines.iter().position(|l| l.contains("Section")).unwrap();
+        assert_eq!(rp.line_kinds[idx], LineKind::H2);
+    }
+
+    #[test]
+    fn h3_gets_linekind_h3() {
+        let page = ParsedPage::parse_html("<html><body><h3>Sub</h3></body></html>");
+        let rp = render_full(&page);
+        let idx = rp.lines.iter().position(|l| l.contains("Sub")).unwrap();
+        assert_eq!(rp.line_kinds[idx], LineKind::H3);
+    }
+
+    #[test]
+    fn h4_gets_linekind_h4plus() {
+        let page = ParsedPage::parse_html("<html><body><h4>Fine</h4></body></html>");
+        let rp = render_full(&page);
+        let idx = rp.lines.iter().position(|l| l.contains("Fine")).unwrap();
+        assert_eq!(rp.line_kinds[idx], LineKind::H4Plus);
+    }
+
+    #[test]
+    fn h1_line_has_block_glyph_prefix() {
+        let page = ParsedPage::parse_html("<html><body><h1>Hello</h1></body></html>");
+        let rp = render_full(&page);
+        let line = rp.lines.iter().find(|l| l.contains("Hello")).unwrap();
+        assert!(line.starts_with("▌ "), "got: {line:?}");
     }
 }
