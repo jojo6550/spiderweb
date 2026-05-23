@@ -20,12 +20,24 @@ impl HttpResponse {
             .unwrap_or(false)
     }
 
-    /// Returns `true` if `Content-Type` is `text/html`.
+    /// Returns `true` if `Content-Type` is `text/html` or XHTML.
     pub fn is_html(&self) -> bool {
         self.content_type
             .as_deref()
-            .map(|ct| ct.starts_with("text/html"))
+            .map(|ct| ct.starts_with("text/html") || ct.starts_with("application/xhtml+xml"))
             .unwrap_or(false)
+    }
+
+    /// Charset from `Content-Type`, e.g. `"utf-8"` from `text/html; charset=utf-8`.
+    pub fn charset(&self) -> Option<&str> {
+        let ct = self.content_type.as_deref()?;
+        for part in ct.split(';') {
+            let trimmed = part.trim();
+            if let Some(cs) = trimmed.strip_prefix("charset=") {
+                return Some(cs.trim_matches('"').trim());
+            }
+        }
+        None
     }
 }
 

@@ -3,6 +3,14 @@
 use crate::browser::history::History;
 use crate::renderer::text::{CodeSpan, FieldKind, FormField, LineKind, RenderedForm, RenderedLink};
 
+/// A single focusable item on a page — either a hyperlink or an interactive
+/// form field. Used as the `Tab::focused` cursor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FocusItem {
+    Link(usize),
+    Field(usize),
+}
+
 /// State for a single browser tab.
 pub struct Tab {
     pub url: String,
@@ -17,7 +25,7 @@ pub struct Tab {
     /// Live values for each `fields[i]`, initialised from `fields[i].value` on load.
     pub field_values: Vec<String>,
     pub scroll: usize,
-    pub selected_link: Option<usize>,
+    pub focused: Option<FocusItem>,
     pub loading: bool,
     pub search_matches: Vec<usize>,
     pub search_idx: usize,
@@ -37,10 +45,82 @@ impl Tab {
             fields: Vec::new(),
             field_values: Vec::new(),
             scroll: 0,
-            selected_link: None,
+            focused: None,
             loading: true,
             search_matches: Vec::new(),
             search_idx: 0,
+        }
+    }
+
+    /// All focusable items (links + non-hidden fields) sorted by line number.
+    pub fn build_focus_order(&self) -> Vec<FocusItem> {
+        let mut items: Vec<(usize, FocusItem)> = Vec::new();
+        for (i, link) in self.links.iter().enumerate() {
+            items.push((link.line, FocusItem::Link(i)));
+        }
+        for (i, field) in self.fields.iter().enumerate() {
+            if matches!(field.kind, FieldKind::Hidden) {
+                continue;
+            }
+            items.push((field.line, FocusItem::Field(i)));
+        }
+        items.sort_by_key(|(line, _)| *line);
+        items.into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// Advance focus to the next item in document order, wrapping around.
+    pub fn next_focus(&mut self) {
+        let order = self.build_focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let next_idx = match &self.focused {
+            None => 0,
+            Some(current) => {
+                let pos = order.iter().position(|x| x == current);
+                pos.map(|p| (p + 1) % order.len()).unwrap_or(0)
+            }
+        };
+        self.focused = Some(order[next_idx].clone());
+        self.scroll_to_focused();
+    }
+
+    /// Retreat focus to the previous item in document order, wrapping around.
+    pub fn prev_focus(&mut self) {
+        let order = self.build_focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let next_idx = match &self.focused {
+            None => order.len().saturating_sub(1),
+            Some(current) => {
+                let pos = order.iter().position(|x| x == current);
+                match pos {
+                    Some(0) | None => order.len().saturating_sub(1),
+                    Some(p) => p - 1,
+                }
+            }
+        };
+        self.focused = Some(order[next_idx].clone());
+        self.scroll_to_focused();
+    }
+
+    fn scroll_to_focused(&mut self) {
+        let line = match &self.focused {
+            Some(FocusItem::Link(i)) => self.links.get(*i).map(|l| l.line),
+            Some(FocusItem::Field(i)) => self.fields.get(*i).map(|f| f.line),
+            None => None,
+        };
+        if let Some(l) = line {
+            self.scroll = l;
+        }
+    }
+
+    /// Returns the href of the focused link, or `None` if a field (or nothing) is focused.
+    pub fn selected_href(&self) -> Option<&str> {
+        match &self.focused {
+            Some(FocusItem::Link(i)) => self.links.get(*i).map(|l| l.href.as_str()),
+            _ => None,
         }
     }
 
@@ -54,7 +134,6 @@ impl Tab {
             Some(i) => (i + 1, self.fields.get(i).map(|f| f.form_idx)),
             None => (0, None),
         };
-        // Search after `start` first, restricted to same form if known.
         let after = self
             .fields
             .iter()
@@ -67,7 +146,6 @@ impl Tab {
         if after.is_some() {
             return after;
         }
-        // Wrap to the start of the same form, or any form.
         self.fields
             .iter()
             .enumerate()
@@ -166,42 +244,6 @@ impl Tab {
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = self.lines.len().saturating_sub(1);
     }
-
-    pub fn next_link(&mut self) {
-        if self.links.is_empty() {
-            return;
-        }
-        self.selected_link = Some(match self.selected_link {
-            None => 0,
-            Some(i) => (i + 1) % self.links.len(),
-        });
-        self.scroll_to_link();
-    }
-
-    pub fn prev_link(&mut self) {
-        if self.links.is_empty() {
-            return;
-        }
-        self.selected_link = Some(match self.selected_link {
-            None | Some(0) => self.links.len().saturating_sub(1),
-            Some(i) => i - 1,
-        });
-        self.scroll_to_link();
-    }
-
-    /// Scroll so the selected link is visible.
-    fn scroll_to_link(&mut self) {
-        if let Some(idx) = self.selected_link {
-            if let Some(link) = self.links.get(idx) {
-                self.scroll = link.line;
-            }
-        }
-    }
-
-    pub fn selected_href(&self) -> Option<&str> {
-        let idx = self.selected_link?;
-        self.links.get(idx).map(|l| l.href.as_str())
-    }
 }
 
 /// Manages all open tabs.
@@ -268,16 +310,92 @@ mod tests {
     }
 
     #[test]
-    fn link_cycle_wraps() {
+    fn focus_cycle_wraps_links() {
         let mut tab = Tab::new("https://x.com".into());
         tab.links = vec![
             RenderedLink { href: "https://a.com".into(), line: 0 },
             RenderedLink { href: "https://b.com".into(), line: 2 },
         ];
-        tab.next_link();
-        assert_eq!(tab.selected_link, Some(0));
-        tab.prev_link();
-        assert_eq!(tab.selected_link, Some(1));
+        tab.next_focus();
+        assert_eq!(tab.focused, Some(FocusItem::Link(0)));
+        tab.prev_focus();
+        assert_eq!(tab.focused, Some(FocusItem::Link(1)));
+    }
+
+    #[test]
+    fn focus_order_excludes_hidden() {
+        let mut tab = Tab::new("https://x.com".into());
+        tab.fields = vec![
+            FormField { form_idx: 0, name: "h".into(), kind: FieldKind::Hidden, value: "".into(), line: 0 },
+            FormField { form_idx: 0, name: "q".into(), kind: FieldKind::Text, value: "".into(), line: 1 },
+        ];
+        tab.field_values = vec!["".into(), "".into()];
+        let order = tab.build_focus_order();
+        assert_eq!(order, vec![FocusItem::Field(1)]);
+    }
+
+    #[test]
+    fn focus_order_sorted_by_line() {
+        let mut tab = Tab::new("https://x.com".into());
+        tab.links = vec![RenderedLink { href: "https://a.com".into(), line: 5 }];
+        tab.fields = vec![
+            FormField { form_idx: 0, name: "q".into(), kind: FieldKind::Text, value: "".into(), line: 2 },
+            FormField { form_idx: 0, name: "btn".into(), kind: FieldKind::Submit, value: "Go".into(), line: 8 },
+        ];
+        tab.field_values = vec!["".into(), "Go".into()];
+        let order = tab.build_focus_order();
+        assert_eq!(order, vec![
+            FocusItem::Field(0),
+            FocusItem::Link(0),
+            FocusItem::Field(1),
+        ]);
+    }
+
+    #[test]
+    fn focus_cycle_wraps_mixed() {
+        let mut tab = Tab::new("https://x.com".into());
+        tab.links = vec![RenderedLink { href: "https://a.com".into(), line: 5 }];
+        tab.fields = vec![
+            FormField { form_idx: 0, name: "q".into(), kind: FieldKind::Text, value: "".into(), line: 2 },
+        ];
+        tab.field_values = vec!["".into()];
+        // order: Field(0) at line 2, Link(0) at line 5
+        tab.next_focus();
+        assert_eq!(tab.focused, Some(FocusItem::Field(0)));
+        tab.next_focus();
+        assert_eq!(tab.focused, Some(FocusItem::Link(0)));
+        tab.next_focus(); // wrap
+        assert_eq!(tab.focused, Some(FocusItem::Field(0)));
+    }
+
+    #[test]
+    fn prev_focus_from_none_goes_to_last() {
+        let mut tab = Tab::new("https://x.com".into());
+        tab.links = vec![
+            RenderedLink { href: "https://a.com".into(), line: 0 },
+            RenderedLink { href: "https://b.com".into(), line: 1 },
+        ];
+        tab.prev_focus();
+        assert_eq!(tab.focused, Some(FocusItem::Link(1)));
+    }
+
+    #[test]
+    fn selected_href_none_when_field_focused() {
+        let mut tab = Tab::new("https://x.com".into());
+        tab.fields = vec![
+            FormField { form_idx: 0, name: "q".into(), kind: FieldKind::Text, value: "".into(), line: 0 },
+        ];
+        tab.field_values = vec!["".into()];
+        tab.focused = Some(FocusItem::Field(0));
+        assert_eq!(tab.selected_href(), None);
+    }
+
+    #[test]
+    fn selected_href_returns_href_when_link_focused() {
+        let mut tab = Tab::new("https://x.com".into());
+        tab.links = vec![RenderedLink { href: "https://a.com".into(), line: 0 }];
+        tab.focused = Some(FocusItem::Link(0));
+        assert_eq!(tab.selected_href(), Some("https://a.com"));
     }
 
     fn tab_with_search_form() -> Tab {
@@ -306,7 +424,6 @@ mod tests {
         let mut tab = tab_with_search_form();
         tab.field_values[1] = "hello world".into();
         let q = tab.build_query(0);
-        // Order: hidden first, then text. Submit excluded.
         assert_eq!(q, "csrf=tok&q=hello+world");
     }
 
@@ -320,7 +437,6 @@ mod tests {
 
     #[test]
     fn build_query_includes_empty_named_text() {
-        // Browsers send `q=` for empty named text inputs on GET forms.
         let tab = tab_with_search_form();
         let q = tab.build_query(0);
         assert!(q.contains("q="), "got: {q}");
@@ -335,7 +451,6 @@ mod tests {
     #[test]
     fn next_editable_field_wraps_within_form() {
         let tab = tab_with_search_form();
-        // Only one editable field — next from it wraps back to itself.
         assert_eq!(tab.next_editable_field(Some(1)), Some(1));
     }
 

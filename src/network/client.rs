@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use reqwest::{Client, header};
 use std::time::Duration;
 
+const ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.5";
+
 use crate::network::response::HttpResponse;
 
 const USER_AGENT: &str = concat!("spiderweb/", env!("CARGO_PKG_VERSION"), " (terminal browser)");
@@ -17,11 +20,19 @@ pub struct SpiderClient {
 impl SpiderClient {
     /// Build a new client with sane defaults: cookie store, TLS, 30 s timeout.
     pub fn new() -> Result<Self> {
+        let mut default_headers = header::HeaderMap::new();
+        default_headers.insert(header::ACCEPT, header::HeaderValue::from_static(ACCEPT));
+        default_headers.insert(
+            header::ACCEPT_LANGUAGE,
+            header::HeaderValue::from_static(ACCEPT_LANGUAGE),
+        );
+
         let inner = Client::builder()
             .cookie_store(true)
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .user_agent(USER_AGENT)
+            .default_headers(default_headers)
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self { inner })

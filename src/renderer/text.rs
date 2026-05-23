@@ -14,7 +14,7 @@ const BLOCK: &[&str] = &[
 ];
 
 const SKIP: &[&str] = &[
-    "head", "math", "noscript", "script", "style", "svg", "template",
+    "head", "math", "script", "style", "svg", "template",
 ];
 
 // ── Public output types ───────────────────────────────────────────────────────
@@ -557,9 +557,9 @@ fn render_input(el: ElementRef<'_>, ctx: &mut Ctx) {
             if let Some(idx) = field_idx {
                 ctx.push_field_marker(idx);
             }
-            ctx.push_ansi("\x1b[7m ");
+            ctx.push_str("[ ");
             ctx.push_str(label);
-            ctx.push_ansi(" \x1b[0m ");
+            ctx.push_str(" ] ");
         }
         "checkbox" => {
             let initial = if val.attr("checked").is_some() {
@@ -604,9 +604,12 @@ fn render_input(el: ElementRef<'_>, ctx: &mut Ctx) {
             if let Some(idx) = field_idx {
                 ctx.push_field_marker(idx);
             }
-            ctx.push_ansi("\x1b[2m[");
-            ctx.push_str(&label);
-            ctx.push_str(" __]\x1b[0m ");
+            let truncated: String = label.chars().take(18).collect();
+            let pad = "_".repeat(18usize.saturating_sub(truncated.chars().count()));
+            ctx.push_char('[');
+            ctx.push_str(&truncated);
+            ctx.push_str(&pad);
+            ctx.push_str("] ");
         }
     }
 }
@@ -629,9 +632,9 @@ fn render_button(el: ElementRef<'_>, ctx: &mut Ctx) {
     if let Some(idx) = field_idx {
         ctx.push_field_marker(idx);
     }
-    ctx.push_ansi("\x1b[7m ");
+    ctx.push_str("[ ");
     ctx.push_str(label);
-    ctx.push_ansi(" \x1b[0m ");
+    ctx.push_str(" ] ");
 }
 
 fn render_textarea(el: ElementRef<'_>, ctx: &mut Ctx) {
@@ -651,9 +654,12 @@ fn render_textarea(el: ElementRef<'_>, ctx: &mut Ctx) {
     if let Some(idx) = field_idx {
         ctx.push_field_marker(idx);
     }
-    ctx.push_ansi("\x1b[2m[");
-    ctx.push_str(&preview);
-    ctx.push_str(" __]\x1b[0m ");
+    let truncated: String = preview.chars().take(24).collect();
+    let pad = "_".repeat(24usize.saturating_sub(truncated.chars().count()));
+    ctx.push_char('[');
+    ctx.push_str(&truncated);
+    ctx.push_str(&pad);
+    ctx.push_str("] ");
 }
 
 fn render_select(el: ElementRef<'_>, ctx: &mut Ctx) {
@@ -686,9 +692,9 @@ fn render_select(el: ElementRef<'_>, ctx: &mut Ctx) {
     if let Some(idx) = field_idx {
         ctx.push_field_marker(idx);
     }
-    ctx.push_ansi("\x1b[2m[");
+    ctx.push_str("[ ");
     ctx.push_str(&label);
-    ctx.push_str(" ▼]\x1b[0m ");
+    ctx.push_str(" \u{25be} ] ");
 }
 
 fn render_link(el: ElementRef<'_>, ctx: &mut Ctx) {

@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::{App, InputMode};
+use crate::browser::tabs::FocusItem;
 use crate::renderer::text::{CodeSpan, LineKind};
 
 // ── Catppuccin Mocha palette ──────────────────────────────────────────────────
@@ -184,7 +185,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         InputMode::FieldEdit { .. } => ("INPUT", C_PINK),
     };
     let hints = match &app.input_mode {
-        InputMode::Normal => " o:open  f:hints  i:input  /:search  b:bmark  j/k:scroll  t:tab",
+        InputMode::Normal => " o:URL  Tab:focus  Enter:activate  i:text  f:hints  /:search  b:bmark",
         InputMode::Search(_) => " Esc:cancel  Enter:done  n/N:next/prev",
         InputMode::Url(_) => " Enter:go  Esc:cancel  Ctrl+W:clear-word  Backspace:del",
         InputMode::Hint(_) => " type letters to follow  ·  Shift+letters:new tab  ·  Esc:cancel",
@@ -216,9 +217,34 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.tabs.current();
 
     if tab.lines.is_empty() && !tab.loading {
-        let msg = if app.status.is_empty() { "No content" } else { app.status.as_str() };
+        use ratatui::text::Text;
+        let title_line = if tab.title.is_empty() {
+            tab.url.split('/').nth(2).unwrap_or(&tab.url).to_owned()
+        } else {
+            tab.title.clone()
+        };
+        let status_line = if !app.status.is_empty() {
+            app.status.as_str()
+        } else {
+            "Page requires JavaScript — no renderable content"
+        };
+        let text = Text::from(vec![
+            Line::from(Span::styled(
+                format!("  {title_line}"),
+                Style::new().fg(C_MAUVE).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  {status_line}"),
+                Style::new().fg(C_RED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  o: enter URL  ·  Backspace: go back",
+                Style::new().fg(C_OVERLAY),
+            )),
+        ]);
         frame.render_widget(
-            Paragraph::new(msg).style(Style::new().fg(C_RED).bg(C_BASE)),
+            Paragraph::new(text).style(Style::new().bg(C_BASE)),
             area,
         );
         return;
@@ -235,12 +261,19 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         .skip(tab.scroll)
         .take(viewport_h)
         .map(|(i, text)| {
-            let is_selected_link = !in_hint_mode
-                && tab
-                    .selected_link
-                    .and_then(|sel| tab.links.get(sel))
-                    .map(|rl| rl.line == i)
-                    .unwrap_or(false);
+            let (is_focused_link, is_focused_field) = if in_hint_mode {
+                (false, false)
+            } else {
+                match &tab.focused {
+                    Some(FocusItem::Link(sel)) => {
+                        (tab.links.get(*sel).map(|l| l.line == i).unwrap_or(false), false)
+                    }
+                    Some(FocusItem::Field(sel)) => {
+                        (false, tab.fields.get(*sel).map(|f| f.line == i).unwrap_or(false))
+                    }
+                    None => (false, false),
+                }
+            };
             let is_current_match = !tab.search_matches.is_empty()
                 && tab.search_matches[tab.search_idx] == i;
             let is_other_match = !is_current_match && tab.search_matches.contains(&i);
@@ -270,13 +303,21 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
 
             let mut spans: Vec<Span> = vec![Span::raw("  ")]; // 2-char left margin
 
-            if is_selected_link {
+            if is_focused_link {
                 spans.push(Span::styled(
                     text.as_str(),
                     Style::new()
                         .bg(C_SURFACE1)
                         .fg(C_SKY)
                         .add_modifier(Modifier::UNDERLINED),
+                ));
+            } else if is_focused_field {
+                spans.push(Span::styled(
+                    text.as_str(),
+                    Style::new()
+                        .bg(C_SURFACE1)
+                        .fg(C_GREEN)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else if is_current_match {
                 spans.push(Span::styled(text.as_str(), Style::new().bg(C_RED).fg(C_CRUST)));

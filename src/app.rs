@@ -54,6 +54,7 @@ pub enum BgMsg {
         code_spans: Vec<text_renderer::CodeSpan>,
         forms: Vec<RenderedForm>,
         fields: Vec<FormField>,
+        http_status: u16,
     },
     Error {
         tab_idx: usize,
@@ -128,6 +129,7 @@ impl App {
         match msg {
             BgMsg::Loaded {
                 tab_idx, url, title, lines, links, line_kinds, code_spans, forms, fields,
+                http_status,
             } => {
                 if let Some(tab) = self.tabs.tabs.get_mut(tab_idx) {
                     tab.url = url;
@@ -141,9 +143,12 @@ impl App {
                     tab.forms = forms;
                     tab.fields = fields;
                     tab.scroll = 0;
-                    tab.selected_link = None;
+                    tab.focused = None;
                     tab.loading = false;
                     tab.clear_search();
+                }
+                if http_status >= 400 {
+                    self.status = format!("HTTP {http_status}");
                 }
             }
             BgMsg::Error { tab_idx, message } => {
@@ -172,7 +177,7 @@ impl App {
         tab.history.push(tab.url.clone());
         tab.url = url.clone();
         tab.loading = true;
-        tab.selected_link = None;
+        tab.focused = None;
         tab.clear_search();
         self.status.clear();
         let tab_idx = self.tabs.active;
@@ -186,7 +191,7 @@ impl App {
         if let Some(prev) = tab.history.go_back(&current) {
             tab.url = prev.clone();
             tab.loading = true;
-            tab.selected_link = None;
+            tab.focused = None;
             tab.clear_search();
             self.status.clear();
             tokio::spawn(fetch_page(prev, tab_idx, tx.clone(), self.client.clone()));
@@ -202,7 +207,7 @@ impl App {
         if let Some(next) = tab.history.go_forward(&current) {
             tab.url = next.clone();
             tab.loading = true;
-            tab.selected_link = None;
+            tab.focused = None;
             tab.clear_search();
             self.status.clear();
             tokio::spawn(fetch_page(next, tab_idx, tx.clone(), self.client.clone()));
@@ -290,6 +295,16 @@ impl App {
 
 // ── URL resolver ──────────────────────────────────────────────────────────────
 
+/// Normalize raw user input: add `https://` when no scheme present.
+pub fn normalize_url_input(url: &str) -> String {
+    let s = url.trim();
+    if s.contains("://") {
+        s.to_owned()
+    } else {
+        format!("https://{s}")
+    }
+}
+
 fn resolve_url(base: &str, href: &str) -> Option<String> {
     if href.starts_with("http://") || href.starts_with("https://") {
         return Some(href.to_owned());
@@ -324,8 +339,17 @@ async fn fetch_page(url: String, tab_idx: usize, tx: Sender<BgMsg>, client: Spid
     let _ = tx.send(msg).await;
 }
 
+fn decode_body(bytes: &[u8], charset: Option<&str>) -> String {
+    let encoding = charset
+        .and_then(|cs| encoding_rs::Encoding::for_label(cs.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (cow, _, _) = encoding.decode(bytes);
+    cow.into_owned()
+}
+
 async fn fetch_inner(url: &str, tab_idx: usize, client: SpiderClient) -> Result<BgMsg> {
     let resp = client.fetch(url).await?;
+    let http_status = resp.status.as_u16();
 
     struct PageData {
         lines: Vec<String>,
@@ -341,21 +365,34 @@ async fn fetch_inner(url: &str, tab_idx: usize, client: SpiderClient) -> Result<
     let PageData {
         mut lines, mut links, title, mut images, mut line_kinds, code_spans, forms, mut fields,
     } = if resp.is_html() {
-        let page = ParsedPage::from_bytes(&resp.body);
+        let text = decode_body(&resp.body, resp.charset());
+        let page = ParsedPage::parse_html(&text);
         let title = page.title();
+        let description = page.description();
         let r = text_renderer::render_full(&page);
+        // For JS-heavy pages with no renderable body, surface meta description.
+        let lines = if r.lines.is_empty() {
+            if let Some(desc) = description {
+                vec![desc]
+            } else {
+                r.lines
+            }
+        } else {
+            r.lines
+        };
+        let line_kinds = vec![text_renderer::LineKind::Normal; lines.len()];
         PageData {
-            lines: r.lines,
+            lines,
             links: r.links,
             title,
             images: r.images,
-            line_kinds: r.line_kinds,
+            line_kinds,
             code_spans: r.code_spans,
             forms: r.forms,
             fields: r.fields,
         }
     } else if resp.is_text() {
-        let text = String::from_utf8_lossy(&resp.body);
+        let text = decode_body(&resp.body, resp.charset());
         let lines: Vec<String> = text.lines().map(str::to_owned).collect();
         let line_kinds = vec![text_renderer::LineKind::Normal; lines.len()];
         PageData {
@@ -386,6 +423,7 @@ async fn fetch_inner(url: &str, tab_idx: usize, client: SpiderClient) -> Result<
 
     Ok(BgMsg::Loaded {
         tab_idx, url: url.to_owned(), title, lines, links, line_kinds, code_spans, forms, fields,
+        http_status,
     })
 }
 
@@ -478,6 +516,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 /// Run the browser starting at `url`.
 pub async fn run(url: String) -> Result<()> {
+    let url = normalize_url_input(&url);
     let settings = Settings::load().unwrap_or_default();
     let bookmarks = Bookmarks::load().unwrap_or_else(|_| Bookmarks::empty());
     let client = SpiderClient::new()?;

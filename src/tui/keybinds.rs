@@ -32,8 +32,9 @@ fn handle_field_edit(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
     };
     match (key.modifiers, key.code) {
         (KeyModifiers::NONE, KeyCode::Esc) => {
-            // Discard buffer.
             app.input_mode = InputMode::Normal;
+            app.tabs.current_mut().focused =
+                Some(crate::browser::tabs::FocusItem::Field(field_idx));
         }
         (KeyModifiers::NONE, KeyCode::Enter) => {
             commit_field_buffer(app, field_idx, buffer);
@@ -44,6 +45,8 @@ fn handle_field_edit(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
                 .get(field_idx)
                 .map(|f| f.form_idx);
             app.input_mode = InputMode::Normal;
+            app.tabs.current_mut().focused =
+                Some(crate::browser::tabs::FocusItem::Field(field_idx));
             if let Some(fi) = form_idx {
                 app.submit_form(fi, tx);
             }
@@ -130,7 +133,7 @@ fn handle_url(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
             app.input_mode = InputMode::Normal;
         }
         (KeyModifiers::NONE, KeyCode::Enter) => {
-            let url = buf.clone();
+            let url = crate::app::normalize_url_input(&buf);
             app.input_mode = InputMode::Normal;
             if !url.is_empty() {
                 app.navigate(url, tx);
@@ -247,21 +250,100 @@ fn handle_normal(key: KeyEvent, app: &mut App, tx: &Sender<BgMsg>) {
             app.tabs.current_mut().scroll_to_bottom();
         }
 
-        // ── Link selection ────────────────────────────────────────────────────
+        // ── Focus navigation ──────────────────────────────────────────────────
         (KeyModifiers::NONE, KeyCode::Tab) => {
-            app.tabs.current_mut().next_link();
+            app.tabs.current_mut().next_focus();
         }
         (KeyModifiers::SHIFT, KeyCode::BackTab) => {
-            app.tabs.current_mut().prev_link();
+            app.tabs.current_mut().prev_focus();
         }
 
-        // ── Navigation ────────────────────────────────────────────────────────
+        // ── Activate focused item ─────────────────────────────────────────────
         (KeyModifiers::NONE, KeyCode::Enter) => {
-            let href = app.tabs.current().selected_href().map(str::to_owned);
-            if let Some(href) = href {
-                app.navigate(href, tx);
-            } else {
-                app.status = "No link selected — press Tab to select a link".into();
+            use crate::browser::tabs::FocusItem;
+            use crate::renderer::text::FieldKind;
+            let focused = app.tabs.current().focused.clone();
+            match focused {
+                None => {
+                    app.status = "Nothing focused — press Tab to select".into();
+                }
+                Some(FocusItem::Link(_)) => {
+                    let href = app.tabs.current().selected_href().map(str::to_owned);
+                    if let Some(href) = href {
+                        app.navigate(href, tx);
+                    }
+                }
+                Some(FocusItem::Field(field_idx)) => {
+                    let kind = app.tabs.current().fields
+                        .get(field_idx)
+                        .map(|f| f.kind.clone());
+                    match kind {
+                        Some(FieldKind::Submit) => {
+                            let form_idx = app.tabs.current().fields
+                                .get(field_idx)
+                                .map(|f| f.form_idx);
+                            if let Some(fi) = form_idx {
+                                app.submit_form(fi, tx);
+                            }
+                        }
+                        Some(FieldKind::Text | FieldKind::Textarea) => {
+                            let buffer = app.tabs.current().field_values
+                                .get(field_idx)
+                                .cloned()
+                                .unwrap_or_default();
+                            if let Some(line) = app.tabs.current().fields.get(field_idx).map(|f| f.line) {
+                                app.tabs.current_mut().scroll = line;
+                            }
+                            app.input_mode = InputMode::FieldEdit { field_idx, buffer };
+                        }
+                        Some(FieldKind::Checkbox) => {
+                            let toggle_val = app.tabs.current().fields
+                                .get(field_idx)
+                                .map(|f| f.value.clone())
+                                .unwrap_or_default();
+                            if let Some(slot) = app.tabs.current_mut().field_values.get_mut(field_idx) {
+                                *slot = if slot.is_empty() { toggle_val } else { String::new() };
+                            }
+                        }
+                        Some(FieldKind::Radio) => {
+                            let (radio_val, radio_name, radio_form) = app.tabs.current().fields
+                                .get(field_idx)
+                                .map(|f| (f.value.clone(), f.name.clone(), f.form_idx))
+                                .unwrap_or_else(|| (String::new(), String::new(), 0));
+                            let siblings: Vec<usize> = app.tabs.current().fields
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, f)| {
+                                    f.form_idx == radio_form
+                                        && f.name == radio_name
+                                        && matches!(f.kind, FieldKind::Radio)
+                                        && *i != field_idx
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+                            if let Some(slot) = app.tabs.current_mut().field_values.get_mut(field_idx) {
+                                *slot = radio_val;
+                            }
+                            for i in siblings {
+                                if let Some(slot) = app.tabs.current_mut().field_values.get_mut(i) {
+                                    *slot = String::new();
+                                }
+                            }
+                        }
+                        Some(FieldKind::Select(opts)) => {
+                            let current = app.tabs.current().field_values
+                                .get(field_idx)
+                                .cloned()
+                                .unwrap_or_default();
+                            let cur_idx = opts.iter().position(|o| o == &current).unwrap_or(0);
+                            let next_idx = (cur_idx + 1) % opts.len().max(1);
+                            if let Some(slot) = app.tabs.current_mut().field_values.get_mut(field_idx) {
+                                *slot = opts.get(next_idx).cloned().unwrap_or_default();
+                            }
+                        }
+                        Some(FieldKind::Hidden) | None => {}
+                    }
+                }
             }
         }
         (KeyModifiers::NONE, KeyCode::Backspace) => {
